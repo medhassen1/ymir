@@ -1,0 +1,11 @@
+/target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/coverage
+**/*.rs.bk
+*.pdb
+crash-*
+leak-*
+timeout-*
+oom-*
+__pycache__/

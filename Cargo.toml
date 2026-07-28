@@ -1,0 +1,24 @@
+[package]
+name = "ymir"
+version = "0.4.2"
+edition = "2021"
+rust-version = "1.74"
+description = "A persistent voxel world store: region containers, palette-compressed chunk sections, light propagation, greedy meshing, and entity storage."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["voxel", "world", "chunk", "region", "mesh"]
+categories = ["game-development", "data-structures"]
+
+[lib]
+name = "ymir"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ymir-inspect"
+path = "src/bin/inspect.rs"
+
+[profile.release]
+debug = 1
+
+[profile.bench]
+debug = 1
