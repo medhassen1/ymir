@@ -1,0 +1,32 @@
+[package]
+name = "ymir-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ymir]
+path = ".."
+
+[[bin]]
+name = "a_rebuild_fuzzer"
+path = "a_rebuild_fuzzer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "b_verify_fuzzer"
+path = "b_verify_fuzzer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "c_column_fuzzer"
+path = "c_column_fuzzer.rs"
+test = false
+doc = false
