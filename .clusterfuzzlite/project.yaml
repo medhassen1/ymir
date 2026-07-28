@@ -3,7 +3,6 @@ sanitizers:
   - address
 fuzzing_engines:
   - libfuzzer
-main_repo: "https://github.com/medhassen1/ymir"
 fuzz_targets:
   # Full rebuild: the header's flag bits steer this into any of the eleven
   # rebuild stages, so one target reaches every subsystem.
