@@ -64,8 +64,8 @@ pub fn fold_span(cursor: *const u32, units: usize, blocks: usize) -> u64 {
     if cursor.is_null() || units == 0 {
         return fold_view(&[], blocks);
     }
-    // SAFETY: `cursor` names the cache's resident buffer for this column and
-    // `units` is the entry count that column packed into it.
+    // SAFETY: per this function's contract, the caller guarantees `cursor`
+    // addresses at least `units` live entries.
     let span = unsafe { std::slice::from_raw_parts(cursor, units) };
     fold_view(span, blocks)
 }

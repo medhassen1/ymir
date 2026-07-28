@@ -4,19 +4,19 @@
 //! schedule a tick at a future world time. Draining the queue means selecting
 //! everything due this tick, ordering it deterministically, and firing it.
 //!
-//! A region with many due ticks fires them in waves rather than all at once: a
-//! busy tick drains its queue one batch of chunks at a time, one round per
-//! batch. [`EntryPool`] gives the drain a home for every round's fired
-//! entries that outlives any single round — built once per drain, it appends
-//! each round's entries into fixed-size chunks and hands back a pointer into
-//! them instead of an owned buffer. A busy round is also kept as a retained
-//! cross-round anchor, so a later round's ranking pass can measure drift from
-//! a round whose own turn through the pool has already passed. Because the
-//! pool lives for the whole drain, its memory is bounded separately from any
-//! one round's lifetime: once the cumulative drained count crosses a
-//! threshold, [`EntryPool::compact`] recycles the oldest chunks, the way a
-//! scheduler reclaims cold pages instead of growing without bound on a region
-//! with a long due window.
+//! A region with a long due window fires its ticks in waves rather than all at
+//! once: the drain cuts the ordered queue into rounds, one per due-time window
+//! (see [`WINDOW_TICKS`]), and fires a round at a time. Rounds are staged
+//! through [`RoundBuffers`], a pair of buffers the drain alternates between, so
+//! the round being fired and the round before it are both addressable without
+//! copying either out — which is what lets a cross-round anchor measure drift
+//! from a round whose own turn has already passed. Alternating between two
+//! buffers is also what bounds the drain's memory: a region with a hundred
+//! rounds holds two of them, not a hundred.
+//!
+//! The anchors themselves live in a [`CarryRing`] of fixed capacity, so what
+//! the closing ranking pass costs is bounded by the ring rather than by how
+//! many rounds the drain took.
 
 use crate::budget;
 use crate::common::*;
@@ -129,116 +129,127 @@ pub fn load_queue(region: &Region) -> TickQueue {
     q
 }
 
-/// Entries held by one [`EntryPool`] chunk.
+/// Entries one round fires, at most.
 ///
-/// An ordinary round's fired batch fits with room to spare, so a typical
-/// commit never has to look past the chunk it lands in.
-const POOL_CHUNK_ENTRIES: usize = 64;
-
-/// Cumulative drained entries across the pool's live chunks that triggers
-/// [`EntryPool::compact`].
-///
-/// An ordinary region — a modest due window, drained in a handful of rounds —
-/// never approaches this. A region with a long due window drained in many
-/// rounds does, which is exactly the case the bound exists to catch: without
-/// it, a region-lifetime pool would keep every round's entries resident for
-/// the whole drain no matter how many rounds it takes.
-const COMPACT_THRESHOLD_ENTRIES: usize = 256;
-
-/// How many due entries fire in one round.
-///
-/// A real scheduler drains a batch of chunks at a time rather than the whole
+/// A real scheduler drains a bounded batch at a time rather than the whole
 /// world in one pass; this is that batch size for the tick queue.
 const ROUND_SIZE: usize = 32;
 
-/// A round firing at least this many entries is busy enough to be worth
-/// keeping as a cross-round ordering anchor.
-const RETAIN_MIN_ENTRIES: usize = 16;
-
-/// A region-lifetime pool for committed round entries.
+/// The due-time window one round covers.
 ///
-/// Built once per drain rather than once per round, so a pointer handed out
-/// while firing one round stays valid while later rounds are fired — which is
-/// what lets a retained anchor (see [`drain_region`]) be read again well
-/// after its own round has finished. Entries are appended into fixed-size
-/// chunks, each stored as an exact-sized boxed slice; a chunk with no room
-/// left for the next commit is left as-is and a fresh one takes over, so a
-/// single commit is never split across two chunks.
-struct EntryPool {
-    /// Chunks holding committed round entries, oldest first.
-    chunks: Vec<Box<[TickEntry]>>,
-    /// Entries already written into the last chunk.
-    used: usize,
-    /// Entries held across all currently resident chunks.
-    resident: usize,
+/// The queue is ordered by due time, so ticks due within the same window are
+/// contiguous and fire together. Cutting rounds on the window boundary rather
+/// than purely on a count is what keeps a tick's wave-mates in its own round: a
+/// region with a long due window drains in waves instead of in one pass.
+const WINDOW_TICKS: u32 = 256;
+
+/// Cross-round anchors the carry ring keeps addressable at once.
+///
+/// Four is enough for the closing pass to rank against a handful of recent
+/// rounds while keeping its cost — and the rounds it holds on to —
+/// independent of how many rounds the drain took.
+const CARRY_SLOTS: usize = 4;
+
+/// The pair of buffers the drain alternates rounds between.
+///
+/// Staging a round takes the side the previous round did not, so the round
+/// being fired and the round before it are both addressable. A side is
+/// reallocated only when the incoming round does not fit the buffer already
+/// there; a round that fits reuses it, which is the point of keeping two
+/// buffers rather than allocating one per round.
+struct RoundBuffers {
+    sides: [Option<Box<[TickEntry]>>; 2],
+    /// The side the next round stages into.
+    flip: usize,
 }
 
-impl EntryPool {
-    fn new() -> EntryPool {
-        EntryPool { chunks: Vec::new(), used: 0, resident: 0 }
+impl RoundBuffers {
+    fn new() -> RoundBuffers {
+        RoundBuffers { sides: [None, None], flip: 0 }
     }
 
-    /// Commit `entries` into the pool and return a pointer to where they
+    /// Stage `round` into the next side and return a pointer to where it
     /// landed.
     ///
-    /// If what remains of the current chunk cannot hold `entries`, a fresh
-    /// chunk takes over first, so the returned pointer's `entries.len()`
-    /// entries are always contiguous — addressing live memory for as long as
-    /// the chunk backing them stays resident (see [`EntryPool::compact`]).
-    fn commit(&mut self, entries: &[TickEntry]) -> *const TickEntry {
-        let len = entries.len();
-        let fits_current = self.chunks.last().is_some_and(|c| self.used + len <= c.len());
-        if !fits_current {
-            let cap = len.max(POOL_CHUNK_ENTRIES);
-            let filler = TickEntry { at_tick: 0, target: 0, priority: 0, sub_order: 0 };
-            self.chunks.push(vec![filler; cap].into_boxed_slice());
-            self.used = 0;
-            self.resident += cap;
+    /// The returned pointer addresses `round.len()` live entries for as long as
+    /// the buffer holding them is still the one on that side.
+    fn stage(&mut self, round: &[TickEntry]) -> *const TickEntry {
+        let side = self.flip;
+        self.flip ^= 1;
+        let reusable = self.sides[side].as_ref().is_some_and(|b| b.len() >= round.len());
+        if reusable {
+            let buffer = self.sides[side].as_mut().expect("the side was just found reusable");
+            buffer[..round.len()].copy_from_slice(round);
+        } else {
+            // Nothing on this side yet, or what is there is too small for the
+            // incoming round: the side takes a buffer sized to this round and
+            // releases whatever it displaces.
+            self.sides[side] = Some(round.to_vec().into_boxed_slice());
         }
-        let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
-        chunk[self.used..self.used + len].copy_from_slice(entries);
-        // SAFETY: `chunk` is a live `Box<[TickEntry]>` at least `self.used +
-        // len` entries long — either it already fit `entries` past
-        // `self.used`, or a chunk sized to hold at least `entries` was just
-        // pushed — so this offset and the `len` entries from it lie inside
-        // the allocation.
-        let ptr = unsafe { chunk.as_ptr().add(self.used) };
-        self.used += len;
-        ptr
-    }
-
-    /// Drop the oldest resident chunks until the pool's accumulated entries
-    /// fall back to `threshold`, or only the chunk currently being written to
-    /// is left.
-    ///
-    /// This is the pool's memory bound: left unchecked, a region-lifetime pool
-    /// would keep every round's entries resident for the whole drain no
-    /// matter how many rounds it takes. The chunk currently being written to
-    /// is never dropped, since the next commit needs somewhere to land.
-    fn compact(&mut self, threshold: usize) {
-        while self.resident > threshold && self.chunks.len() > 1 {
-            let oldest = self.chunks.remove(0);
-            self.resident -= oldest.len();
-        }
+        let buffer = self.sides[side].as_ref().expect("the side holds a buffer either way");
+        buffer.as_ptr()
     }
 }
 
-/// A round's entries retained past its own turn through the drain, for the
-/// closing cross-round ranking pass to read.
-struct RetainedAnchor {
+/// A round staged into [`RoundBuffers`] and carried past its own turn, for the
+/// drain's closing cross-round ranking pass to read.
+struct CarriedRound {
     ptr: *const TickEntry,
     len: usize,
 }
 
+/// A fixed-capacity ring of cross-round anchors.
+///
+/// Carrying a round takes the next slot in round-robin order, displacing
+/// whatever was carried [`CARRY_SLOTS`] rounds ago. Bounding the ring is what
+/// keeps the drain's cross-round state — and the closing pass's cost — flat
+/// over a region with a long due window, instead of growing one entry per round
+/// the way a plain list would.
+struct CarryRing {
+    slots: [Option<CarriedRound>; CARRY_SLOTS],
+    next: usize,
+}
+
+impl CarryRing {
+    fn new() -> CarryRing {
+        CarryRing { slots: Default::default(), next: 0 }
+    }
+
+    /// Carry `round` as the newest cross-round anchor.
+    fn carry(&mut self, round: CarriedRound) {
+        self.slots[self.next] = Some(round);
+        self.next = (self.next + 1) % CARRY_SLOTS;
+    }
+
+    /// The anchors the ring currently holds, in slot order.
+    fn rounds(&self) -> impl Iterator<Item = &CarriedRound> {
+        self.slots.iter().flatten()
+    }
+}
+
+/// How far the round starting at `entries[i]` reaches.
+///
+/// A round runs to the end of the due-time window its first entry falls in, or
+/// to [`ROUND_SIZE`] entries, whichever comes first. The queue is ordered by
+/// due time before this is called, so a window's entries are contiguous.
+fn round_end(entries: &[TickEntry], i: usize) -> usize {
+    let window = entries[i].at_tick / WINDOW_TICKS;
+    let cap = (i + ROUND_SIZE).min(entries.len());
+    let mut end = i + 1;
+    while end < cap && entries[end].at_tick / WINDOW_TICKS == window {
+        end += 1;
+    }
+    end
+}
+
 /// Drain the region's due ticks and fold a digest of what fired.
 ///
-/// The due queue is ordered once, then drained in rounds of [`ROUND_SIZE`]
-/// entries — one round per batch of chunks, rather than firing the whole
-/// queue in a single pass. Each round's entries are committed into a
-/// region-lifetime [`EntryPool`] and fired immediately; a busy round is also
-/// kept as a retained cross-round anchor. Once every round has fired, the
-/// drain's closing pass ranks every retained anchor once more, measuring a
-/// round's drift from an anchor whose own turn through the pool has already
+/// The due queue is ordered once, then cut into rounds — one per due-time
+/// window, capped at [`ROUND_SIZE`] entries — rather than fired in a single
+/// pass. Each round is staged into the drain's [`RoundBuffers`] and fired
+/// immediately, and carried in the [`CarryRing`] as a cross-round anchor. Once
+/// every round has fired, the drain's closing pass ranks the anchors the ring
+/// still holds, measuring a round's drift from one whose own turn has already
 /// passed.
 pub fn drain_region(region: &Region, n: usize) -> u64 {
     let mut queue = load_queue(region);
@@ -261,39 +272,31 @@ pub fn drain_region(region: &Region, n: usize) -> u64 {
     let slack = budget::pool_slots(region, n);
 
     let entries = queue.entries();
-    let mut pool = EntryPool::new();
-    let mut retained: Vec<RetainedAnchor> = Vec::new();
+    let mut buffers = RoundBuffers::new();
+    let mut carried = CarryRing::new();
     let mut acc = 0xffu64 ^ (n as u64);
 
     let mut i = 0;
     while i < entries.len() {
-        let end = (i + ROUND_SIZE).min(entries.len());
+        let end = round_end(entries, i);
         let round = &entries[i..end];
 
-        // Commit this round's entries into the region's pool. Only past this
-        // point is there a pointer stable enough to retain past this round's
-        // own scope.
-        let ptr = pool.commit(round);
+        // Stage this round into the drain's buffers. Only past this point is
+        // there a pointer stable enough to carry past this round's own turn.
+        let ptr = buffers.stage(round);
 
-        // Fire the round immediately while its committed span is still fresh
-        // off the commit.
+        // Fire the round immediately while its staged span is still fresh off
+        // the flip.
         acc = acc.wrapping_mul(0x100000001b3) ^ drain::fire(round, ptr, slack.max(round.len()));
 
-        // A busy round is kept as a cross-round ordering anchor for the
-        // drain's closing pass to read.
-        if round.len() >= RETAIN_MIN_ENTRIES {
-            retained.push(RetainedAnchor { ptr, len: round.len() });
-        }
-
-        // Bound the pool's resident memory now that this round's entries are
-        // safely committed.
-        pool.compact(COMPACT_THRESHOLD_ENTRIES);
+        // Carry the round as the newest cross-round anchor.
+        carried.carry(CarriedRound { ptr, len: round.len() });
 
         i = end;
     }
 
-    // Close out the drain by ranking every retained anchor once more.
-    for r in &retained {
+    // Close out the drain by ranking every anchor the ring holds.
+    for r in carried.rounds() {
         acc = acc.wrapping_mul(0x100000001b3) ^ drain::fold_anchor(r.ptr, r.len);
     }
     acc
@@ -370,12 +373,27 @@ mod tests {
     }
 
     #[test]
-    fn entry_pool_commit_writes_are_readable_back() {
-        let mut pool = EntryPool::new();
-        let a = pool.commit(&entries(4));
-        let b = pool.commit(&entries(2));
-        // SAFETY: neither chunk has been compacted away, so both pointers
-        // still address the entries just committed.
+    fn a_round_stops_at_the_window_boundary() {
+        let e = vec![entry(0, 0, 0), entry(1, 0, 1), entry(WINDOW_TICKS, 0, 2)];
+        assert_eq!(round_end(&e, 0), 2, "the third entry is in the next window");
+        assert_eq!(round_end(&e, 2), 3);
+    }
+
+    #[test]
+    fn a_round_stops_at_the_batch_size() {
+        let e = entries(ROUND_SIZE + 8);
+        assert_eq!(round_end(&e, 0), ROUND_SIZE);
+    }
+
+    #[test]
+    fn round_buffers_stage_writes_are_readable_back() {
+        let mut buffers = RoundBuffers::new();
+        let first = entries(4);
+        let second = entries(2);
+        let a = buffers.stage(&first);
+        let b = buffers.stage(&second);
+        // SAFETY: the two rounds staged into opposite sides, so neither buffer
+        // has been displaced and both pointers still address what was staged.
         unsafe {
             assert_eq!((*a.add(3)).at_tick, 3);
             assert_eq!((*b.add(1)).at_tick, 1);
@@ -383,31 +401,29 @@ mod tests {
     }
 
     #[test]
-    fn entry_pool_starts_a_new_chunk_once_the_current_one_is_full() {
-        let mut pool = EntryPool::new();
-        pool.commit(&entries(POOL_CHUNK_ENTRIES - 2));
-        assert_eq!(pool.chunks.len(), 1);
-        pool.commit(&entries(5));
-        assert_eq!(pool.chunks.len(), 2);
+    fn round_buffers_alternate_sides() {
+        let mut buffers = RoundBuffers::new();
+        let round = entries(4);
+        let a = buffers.stage(&round);
+        let b = buffers.stage(&round);
+        assert_ne!(a, b, "consecutive rounds must land on different sides");
+        let c = buffers.stage(&round);
+        assert_eq!(a, c, "the third round returns to the first side");
     }
 
     #[test]
-    fn entry_pool_compact_drops_oldest_chunks_once_over_threshold() {
-        let mut pool = EntryPool::new();
-        for _ in 0..6 {
-            pool.commit(&entries(POOL_CHUNK_ENTRIES));
-        }
-        assert_eq!(pool.chunks.len(), 6);
-        pool.compact(3 * POOL_CHUNK_ENTRIES);
-        assert!(pool.chunks.len() < 6, "compact must drop some chunks");
-        assert!(pool.resident <= 3 * POOL_CHUNK_ENTRIES);
-    }
-
-    #[test]
-    fn entry_pool_compact_never_drops_the_last_chunk() {
-        let mut pool = EntryPool::new();
-        pool.commit(&entries(4));
-        pool.compact(0);
-        assert_eq!(pool.chunks.len(), 1, "the chunk being written to must survive");
+    fn a_round_that_fits_reuses_the_buffer_already_there() {
+        let mut buffers = RoundBuffers::new();
+        let wide = entries(8);
+        let narrow = entries(3);
+        let a = buffers.stage(&wide);
+        buffers.stage(&wide);
+        let c = buffers.stage(&narrow);
+        assert_eq!(a, c, "a shorter round must not reallocate the side");
+        assert_eq!(
+            buffers.sides[0].as_ref().expect("the side holds a buffer").len(),
+            8,
+            "the buffer keeps the size it was allocated at"
+        );
     }
 }

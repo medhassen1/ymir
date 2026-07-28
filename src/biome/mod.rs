@@ -7,18 +7,24 @@
 //! A region's biome pass decodes one column at a time, but continuity across
 //! the region means a later column's blend sometimes needs to see an earlier
 //! column's row, not only its own — so a column's decoded cells cannot simply
-//! live and die with that column's turn through the loop. [`CellArena`] gives
+//! live and die with that column's turn through the loop. [`RowStore`] gives
 //! the pass a home for decoded rows that outlives any single column: built
-//! once per region rather than once per column, it appends every column's
-//! cells into fixed-size chunks and hands back a view into them instead of an
-//! owned buffer. A handful of columns, spaced out across the region, register
-//! their opening row in a retained list, so a later column always has a
-//! nearby reference to blend against rather than only ever its immediate
-//! predecessor. Because the arena lives for the whole pass, its memory is
-//! bounded separately from any one column's lifetime: once the accumulated
-//! volume crosses a threshold, [`CellArena::compact`] drops the oldest
-//! chunks, the way a buffer pool reclaims cold pages instead of growing
-//! without bound on a region with many columns.
+//! once per region rather than once per column, it appends every column's rows
+//! into one buffer and hands back a pointer into them instead of an owned
+//! buffer.
+//!
+//! Because the store lives for the whole pass, its memory is bounded by
+//! compaction rather than by any one column's lifetime: a commit with no room
+//! left runs [`RowStore::compact`], which retires the rows of the oldest
+//! columns and slides the survivors down over them, the way a defragmenting
+//! allocator packs its live objects together instead of growing past them.
+//!
+//! Each column registers its opening row with a [`ReferenceRing`], so a later
+//! column always has a nearby reference to blend against rather than only ever
+//! its immediate predecessor. The ring's capacity is fixed rather than one
+//! entry per column: what the closing fold costs, and how many rows the pass
+//! keeps addressable, is then bounded by the ring rather than by how many
+//! columns the region carries.
 
 use crate::blend;
 use crate::common::*;
@@ -28,36 +34,30 @@ use crate::reader::Cursor;
 /// Cells along one edge of a chunk's biome grid.
 pub const GRID_EDGE: usize = BIOME_EDGE;
 
-/// Bytes held by one [`CellArena`] chunk.
+/// Bytes a fresh [`RowStore`] holds.
 ///
 /// A column's decoded volume — the base grid plus up to [`MAX_STACK`]
-/// refinement rows — fits with room to spare, so an ordinary column's commit
-/// never has to look past the chunk it lands in.
-const ARENA_CHUNK_BYTES: usize = 1024;
+/// refinement rows — is far smaller than this, so an ordinary region's columns
+/// all fit without the store ever having to compact. A region built from many
+/// heavily refined columns does not, which is exactly the case compaction
+/// exists to catch: without it, a region-lifetime store would keep every
+/// column's rows resident for the whole pass no matter how many columns the
+/// region carries.
+const STORE_INIT_BYTES: usize = 128;
 
-/// Accumulated resident bytes across an arena's live chunks that triggers
-/// [`CellArena::compact`].
+/// Reference rows the ring keeps addressable at once.
 ///
-/// An ordinary region's biome section — a modest number of columns, most
-/// carrying little or no refinement — never approaches this. A region built
-/// from many heavily refined columns does, which is exactly the case the
-/// bound exists to catch: without it, a region-lifetime arena would keep
-/// every column's rows resident for the whole pass no matter how many
-/// columns the region carries.
-const COMPACT_THRESHOLD_BYTES: usize = 4096;
-
-/// Spacing between columns that register a retained reference row.
-///
-/// The first column has no earlier neighbour to blend against, so retention
-/// starts at the first multiple of the stride past it.
-const RETAIN_STRIDE: usize = 8;
+/// Four is enough for a blend to reach a handful of columns back while keeping
+/// the closing fold's cost — and the rows it holds on to — independent of the
+/// region's column count.
+const REFERENCE_SLOTS: usize = 4;
 
 /// A chunk's biome cells, stored as one span per row rather than a fixed
 /// stride.
 ///
 /// This is the scratch buffer a single column decodes into. [`resolve_region`]
 /// builds one per column, then commits its finished `cells` into the region's
-/// [`CellArena`] so the bytes survive past this struct's own scope. Every row
+/// [`RowStore`] so the bytes survive past this struct's own scope. Every row
 /// of the base grid is [`GRID_EDGE`] cells wide, but a region's sub-cell
 /// refinement layer can contribute a shorter row (see [`BiomeGrid::refine`]),
 /// so each row records its own `(start, len)` span into `cells` instead of
@@ -111,8 +111,8 @@ impl BiomeGrid {
     /// A view of row `z` into this grid's own scratch buffer.
     ///
     /// Only meaningful before the grid's cells are committed into a
-    /// [`CellArena`] — once committed, [`resolve_region`] addresses the row
-    /// through the arena's copy instead (see [`ColumnView::row_ptr`]), since
+    /// [`RowStore`] — once committed, [`resolve_region`] addresses the row
+    /// through the store's copy instead (see [`ColumnView::row_ptr`]), since
     /// this buffer is dropped at the end of the column's scope.
     pub fn row_view(&self, z: usize) -> *const u8 {
         if z >= self.rows {
@@ -183,81 +183,106 @@ impl BiomeGrid {
     }
 }
 
-/// A region-lifetime arena for decoded biome rows.
+/// One column's rows within a [`RowStore`], as `(start, len)` from the store's
+/// own base.
+#[derive(Clone, Copy)]
+struct Extent {
+    start: usize,
+    len: usize,
+}
+
+/// A region-lifetime store for decoded biome rows.
 ///
-/// Built once per region rather than once per column, so a view handed out
+/// Built once per region rather than once per column, so a pointer handed out
 /// while decoding one column stays valid while later columns are decoded —
-/// which is what lets a retained reference row (see [`resolve_region`]) be
-/// read again well after its own column has finished. Cells are appended into
-/// fixed-size chunks, each stored as an exact-sized boxed slice; a chunk with
-/// no room left for the next commit is left as-is and a fresh one takes over,
-/// so a single commit is never split across two chunks.
-struct CellArena {
-    /// Chunks holding committed column bytes, oldest first.
-    chunks: Vec<Box<[u8]>>,
-    /// Bytes already written into the last chunk.
+/// which is what lets a reference row (see [`resolve_region`]) be read again
+/// well after its own column has finished. A column's cells are copied in as
+/// one contiguous run, so a single column's rows are never split.
+///
+/// The store is bounded by compaction rather than by refusing work: see
+/// [`RowStore::compact`].
+struct RowStore {
+    /// The live rows, back to back from offset zero.
+    bytes: Box<[u8]>,
+    /// How much of `bytes` the live rows occupy.
     used: usize,
-    /// Bytes held across all currently resident chunks.
-    resident: usize,
+    /// One entry per committed column, oldest first.
+    extents: Vec<Extent>,
 }
 
-impl CellArena {
-    fn new() -> CellArena {
-        CellArena { chunks: Vec::new(), used: 0, resident: 0 }
-    }
-
-    /// Commit `bytes` into the arena and return a pointer to where they
-    /// landed.
-    ///
-    /// If what remains of the current chunk cannot hold `bytes`, a fresh
-    /// chunk takes over first, so the returned pointer's `bytes.len()` cells
-    /// are always contiguous — addressing live memory for as long as the
-    /// chunk backing them stays resident (see [`CellArena::compact`]).
-    fn commit(&mut self, bytes: &[u8]) -> *const u8 {
-        let len = bytes.len();
-        let fits_current = self.chunks.last().is_some_and(|c| self.used + len <= c.len());
-        if !fits_current {
-            let cap = len.max(ARENA_CHUNK_BYTES);
-            self.chunks.push(vec![0u8; cap].into_boxed_slice());
-            self.used = 0;
-            self.resident += cap;
+impl RowStore {
+    fn new() -> RowStore {
+        RowStore {
+            bytes: vec![0u8; STORE_INIT_BYTES].into_boxed_slice(),
+            used: 0,
+            extents: Vec::new(),
         }
-        let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
-        chunk[self.used..self.used + len].copy_from_slice(bytes);
-        // SAFETY: `chunk` is a live `Box<[u8]>` at least `self.used + len`
-        // bytes long — either it already fit `bytes` past `self.used`, or a
-        // chunk sized to hold at least `bytes` was just pushed — so this
-        // offset and the `len` bytes from it lie inside the allocation.
-        let ptr = unsafe { chunk.as_ptr().add(self.used) };
-        self.used += len;
-        ptr
     }
 
-    /// Drop the oldest resident chunks until the arena's accumulated bytes
-    /// fall back to `threshold`, or only the chunk currently being written to
-    /// is left.
+    /// Commit one column's cells and return a pointer to where they landed.
     ///
-    /// This is the arena's memory bound: left unchecked, a region-lifetime
-    /// arena would keep every column's rows resident for the whole pass no
-    /// matter how many columns the region carries. The chunk currently being
-    /// written to is never dropped, since the next commit needs somewhere to
-    /// land.
-    fn compact(&mut self, threshold: usize) {
-        while self.resident > threshold && self.chunks.len() > 1 {
-            let oldest = self.chunks.remove(0);
-            self.resident -= oldest.len();
+    /// The returned pointer's `cells.len()` bytes are contiguous, and address
+    /// live memory for as long as the buffer holding them is the store's own
+    /// (see [`RowStore::compact`]).
+    fn commit(&mut self, cells: &[u8]) -> *const u8 {
+        if self.used + cells.len() > self.bytes.len() {
+            self.compact(cells.len());
+        }
+        let start = self.used;
+        self.bytes[start..start + cells.len()].copy_from_slice(cells);
+        self.used += cells.len();
+        self.extents.push(Extent { start, len: cells.len() });
+        // SAFETY: the copy above wrote `cells.len()` bytes starting at
+        // `start`, so `start` is an offset inside this allocation.
+        unsafe { self.bytes.as_ptr().add(start) }
+    }
+
+    /// Make room for a commit of `need` bytes.
+    ///
+    /// This is the store's memory bound: left unchecked, a region-lifetime
+    /// store would keep every column's rows resident for the whole pass no
+    /// matter how many columns the region carries. The oldest columns' rows
+    /// are retired one column at a time until the incoming column fits, and
+    /// the surviving rows are then slid down over the retired ones so the live
+    /// rows stay packed at the front of the buffer. The most recent column is
+    /// never retired, since the column about to commit blends against it.
+    ///
+    /// A slide that still leaves no room is followed by a re-fit: the store
+    /// takes a buffer sized to the survivors plus the incoming column, with
+    /// room to take the next few without compacting again, and the exhausted
+    /// buffer is released.
+    fn compact(&mut self, need: usize) {
+        let mut retired = 0usize;
+        let mut cut = 0usize;
+        while retired + 1 < self.extents.len() && self.used - cut + need > self.bytes.len() {
+            let oldest = self.extents[retired];
+            cut = oldest.start + oldest.len;
+            retired += 1;
+        }
+        if cut > 0 {
+            self.bytes.copy_within(cut..self.used, 0);
+            self.used -= cut;
+            self.extents.drain(..retired);
+            for e in &mut self.extents {
+                e.start -= cut;
+            }
+        }
+        if self.used + need > self.bytes.len() {
+            let want = (self.used + need) * 2;
+            let mut refitted = vec![0u8; want].into_boxed_slice();
+            refitted[..self.used].copy_from_slice(&self.bytes[..self.used]);
+            self.bytes = refitted;
         }
     }
 }
 
-/// One column's rows, committed into the region's [`CellArena`].
+/// One column's rows, committed into the region's [`RowStore`].
 ///
 /// Mirrors [`BiomeGrid`]'s `(start, len)` spans, but resolved against the
-/// arena's pointer rather than a private buffer, since by the time this
-/// exists the grid that produced it has already handed its cells to the
-/// arena.
+/// store's pointer rather than a private buffer, since by the time this exists
+/// the grid that produced it has already handed its cells to the store.
 struct ColumnView {
-    /// First cell of this column's grid within the arena.
+    /// First cell of this column's grid within the store.
     base: *const u8,
     /// `(start, len)` into the committed buffer, one per row.
     spans: Vec<(usize, usize)>,
@@ -268,7 +293,7 @@ impl ColumnView {
     fn row_ptr(&self, z: usize) -> *const u8 {
         self.spans.get(z).map_or(std::ptr::null(), |&(start, _)| {
             // SAFETY: `spans` was taken from the `BiomeGrid` whose cells were
-            // just copied into the arena at `base`, so every `start` here
+            // just copied into the store at `base`, so every `start` here
             // falls within that copy.
             unsafe { self.base.add(start) }
         })
@@ -281,12 +306,41 @@ impl ColumnView {
     }
 }
 
-/// A reference row retained past its own column, for a later column's blend
-/// to read — see [`resolve_region`].
+/// A reference row a column registered for later columns to blend against —
+/// see [`resolve_region`].
 struct ReferenceRow {
     ptr: *const u8,
     len: usize,
     z: u8,
+}
+
+/// A fixed-capacity ring of cross-column reference rows.
+///
+/// Registering a row takes the next slot in round-robin order, displacing
+/// whatever reference was there [`REFERENCE_SLOTS`] registrations ago. Bounding
+/// the ring is what keeps the pass's cross-column state — and the closing
+/// fold's cost — flat over a region with many columns, instead of growing one
+/// entry per column the way a plain list would.
+struct ReferenceRing {
+    slots: [Option<ReferenceRow>; REFERENCE_SLOTS],
+    next: usize,
+}
+
+impl ReferenceRing {
+    fn new() -> ReferenceRing {
+        ReferenceRing { slots: Default::default(), next: 0 }
+    }
+
+    /// Register `row` as the newest cross-column reference.
+    fn register(&mut self, row: ReferenceRow) {
+        self.slots[self.next] = Some(row);
+        self.next = (self.next + 1) % REFERENCE_SLOTS;
+    }
+
+    /// The references the ring currently holds, in slot order.
+    fn rows(&self) -> impl Iterator<Item = &ReferenceRow> {
+        self.slots.iter().flatten()
+    }
 }
 
 /// Decode one column's biome grid starting at `c`'s current position,
@@ -322,18 +376,18 @@ fn decode_column(c: &mut Cursor) -> Option<(BiomeGrid, usize)> {
 /// Each column is decoded in turn from the `biom` section, refined if the
 /// region carries sub-cell detail for it, and blended through the same
 /// three-tap stencil [`crate::biome`]'s module docs describe. Its cells are
-/// then committed into a region-wide [`CellArena`] rather than freed with the
-/// column: a spaced-out subset of columns keep their opening row registered
-/// in a retained list for the rest of the pass, giving later columns a
-/// cross-region reference to blend against beyond just their immediate
-/// predecessor. The retained rows are folded into the digest once more at the
-/// end, closing out the pass.
+/// then committed into a region-wide [`RowStore`] rather than freed with the
+/// column, and its opening row is registered with the region's
+/// [`ReferenceRing`], giving later columns a cross-region reference to blend
+/// against beyond just their immediate predecessor. The references the ring
+/// still holds are folded into the digest once more at the end, closing out
+/// the pass.
 pub fn resolve_region(region: &Region) -> u64 {
     let n = region.worked_chunks();
     let mut c = Cursor::new(region.slice(region.biom));
 
-    let mut arena = CellArena::new();
-    let mut retained: Vec<ReferenceRow> = Vec::new();
+    let mut store = RowStore::new();
+    let mut ring = ReferenceRing::new();
     let mut acc = 0xffu64;
 
     for cid in 0..n {
@@ -350,12 +404,12 @@ pub fn resolve_region(region: &Region) -> u64 {
 
         acc ^= grid.variety() as u64;
 
-        // Commit this column's finished cells into the region's arena. Only
-        // past this point is there a pointer stable enough to retain past
-        // this column's own scope.
+        // Commit this column's finished cells into the region's store. Only
+        // past this point is there a pointer stable enough to register as a
+        // cross-column reference.
         let spans = std::mem::take(&mut grid.spans);
-        let base_ptr = arena.commit(&grid.cells);
-        let view = ColumnView { base: base_ptr, spans };
+        let base = store.commit(&grid.cells);
+        let view = ColumnView { base, spans };
 
         for &z in &rows_to_blend {
             let ptr = view.row_ptr(z);
@@ -363,21 +417,14 @@ pub fn resolve_region(region: &Region) -> u64 {
             acc = acc.wrapping_mul(0x100000001b3) ^ blend::mix_row(ptr, len, z as u8);
         }
 
-        // Every `RETAIN_STRIDE`-th column past the first keeps its opening
-        // row alive as a reference for later columns to blend against,
-        // giving the region continuity beyond just each column's immediate
-        // predecessor.
-        if cid > 0 && cid % RETAIN_STRIDE == 0 {
-            retained.push(ReferenceRow { ptr: view.row_ptr(0), len: view.row_len(0), z: 0 });
-        }
-
-        // Bound the arena's resident memory now that this column's bytes are
-        // safely committed.
-        arena.compact(COMPACT_THRESHOLD_BYTES);
+        // Register this column's opening row as the newest cross-column
+        // reference, giving the region continuity beyond just each column's
+        // immediate predecessor.
+        ring.register(ReferenceRow { ptr: view.row_ptr(0), len: view.row_len(0), z: 0 });
     }
 
-    // Close out the pass by folding in every retained reference row once.
-    for r in &retained {
+    // Close out the pass by folding in every reference row the ring holds.
+    for r in ring.rows() {
         acc = acc.wrapping_mul(0x100000001b3) ^ blend::mix_row(r.ptr, r.len, r.z);
     }
 
@@ -449,12 +496,13 @@ mod tests {
     }
 
     #[test]
-    fn arena_commit_writes_are_readable_back() {
-        let mut arena = CellArena::new();
-        let a = arena.commit(&[1, 2, 3, 4]);
-        let b = arena.commit(&[5, 6]);
-        // SAFETY: neither chunk has been compacted away, so both pointers
-        // still address the bytes just committed.
+    fn store_commit_writes_are_readable_back() {
+        let mut store = RowStore::new();
+        let a = store.commit(&[1, 2, 3, 4]);
+        let b = store.commit(&[5, 6]);
+        // SAFETY: the store has not compacted (two tiny commits, far below its
+        // initial size), so both pointers still address the bytes just
+        // committed.
         unsafe {
             assert_eq!(std::slice::from_raw_parts(a, 4), [1, 2, 3, 4]);
             assert_eq!(std::slice::from_raw_parts(b, 2), [5, 6]);
@@ -462,44 +510,55 @@ mod tests {
     }
 
     #[test]
-    fn arena_starts_a_new_chunk_once_the_current_one_is_full() {
-        let mut arena = CellArena::new();
-        let filler = vec![0u8; ARENA_CHUNK_BYTES - 4];
-        arena.commit(&filler);
-        assert_eq!(arena.chunks.len(), 1);
-        // Only 4 bytes remain in the first chunk; this does not fit.
-        arena.commit(&[1, 2, 3, 4, 5]);
-        assert_eq!(arena.chunks.len(), 2);
-    }
-
-    #[test]
-    fn compact_leaves_a_small_arena_untouched() {
-        let mut arena = CellArena::new();
-        arena.commit(&[1, 2, 3]);
-        arena.compact(COMPACT_THRESHOLD_BYTES);
-        assert_eq!(arena.chunks.len(), 1);
-    }
-
-    #[test]
-    fn compact_drops_oldest_chunks_once_over_threshold() {
-        let mut arena = CellArena::new();
-        // Each commit exactly fills its own chunk, so every commit pushes a
-        // new one.
-        for _ in 0..6 {
-            arena.commit(&vec![0u8; ARENA_CHUNK_BYTES]);
+    fn store_leaves_a_small_region_alone() {
+        let mut store = RowStore::new();
+        for _ in 0..4 {
+            store.commit(&[7u8; 16]);
         }
-        assert_eq!(arena.chunks.len(), 6);
-        arena.compact(3 * ARENA_CHUNK_BYTES);
-        assert!(arena.chunks.len() < 6, "compact must drop some chunks");
-        assert!(arena.resident <= 3 * ARENA_CHUNK_BYTES);
+        assert_eq!(store.extents.len(), 4, "no column should have been retired");
+        assert_eq!(store.bytes.len(), STORE_INIT_BYTES, "the store should not have re-fitted");
     }
 
     #[test]
-    fn compact_never_drops_the_last_chunk() {
-        let mut arena = CellArena::new();
-        arena.commit(&[1, 2, 3]);
-        arena.compact(0);
-        assert_eq!(arena.chunks.len(), 1, "the chunk being written to must survive");
+    fn compact_retires_the_oldest_columns_and_packs_the_survivors() {
+        let mut store = RowStore::new();
+        // Eight 16-byte columns exactly fill the initial store.
+        for i in 0..8u8 {
+            store.commit(&[i; 16]);
+        }
+        assert_eq!(store.used, STORE_INIT_BYTES);
+        store.commit(&[99u8; 16]);
+        assert!(store.extents.len() < 9, "the oldest columns must be retired");
+        // The survivors are packed from offset zero, newest last.
+        assert_eq!(store.extents[0].start, 0);
+        let last = store.extents[store.extents.len() - 1];
+        assert_eq!(last.start + last.len, store.used);
+        assert_eq!(&store.bytes[last.start..store.used], &[99u8; 16]);
+    }
+
+    #[test]
+    fn compact_refits_when_the_survivors_leave_no_room() {
+        let mut store = RowStore::new();
+        // Two columns that together outgrow the store: retiring all but the
+        // newest still leaves no room, so the store re-fits.
+        store.commit(&[1u8; 80]);
+        store.commit(&[2u8; 80]);
+        assert!(store.bytes.len() > STORE_INIT_BYTES, "the store must have re-fitted");
+        assert_eq!(store.used, 160);
+    }
+
+    #[test]
+    fn reference_ring_holds_only_its_newest_entries() {
+        let mut ring = ReferenceRing::new();
+        let cells = [1u8, 2, 3, 4];
+        for z in 0..(REFERENCE_SLOTS as u8 + 2) {
+            ring.register(ReferenceRow { ptr: cells.as_ptr(), len: cells.len(), z });
+        }
+        assert_eq!(ring.rows().count(), REFERENCE_SLOTS);
+        let mut depths: Vec<u8> = ring.rows().map(|r| r.z).collect();
+        depths.sort_unstable();
+        // The two oldest registrations have been displaced.
+        assert_eq!(depths, vec![2, 3, 4, 5]);
     }
 
     /// Build a minimal region with a `biom` section, for exercising
@@ -570,25 +629,51 @@ mod tests {
     }
 
     #[test]
-    fn retained_reference_row_influences_the_final_digest() {
-        // Nine columns puts one (column 8) past the first retain stride,
-        // while staying far below the compaction threshold, so its row is
-        // still live when the closing fold reads it.
+    fn the_closing_fold_reads_the_reference_ring() {
+        // A single column: the ring holds its opening row, so the digest is
+        // the per-row blend followed by that one reference folded once more.
+        let mut cells = [0u8; GRID_EDGE * GRID_EDGE];
+        for (i, c) in cells.iter_mut().enumerate() {
+            *c = i as u8 + 1;
+        }
+        let data = region_with_biom(1, &one_column_biom(0, 0, cells));
+        let region = crate::parse::parse(&data).expect("valid region");
+
+        let mut expect = 0xffu64 ^ (GRID_EDGE * GRID_EDGE) as u64;
+        for z in 0..GRID_EDGE {
+            let row = &cells[z * GRID_EDGE..(z + 1) * GRID_EDGE];
+            expect = expect.wrapping_mul(0x100000001b3) ^ blend::mix_slice(row, z as u8);
+        }
+        let opening = &cells[0..GRID_EDGE];
+        expect = expect.wrapping_mul(0x100000001b3) ^ blend::mix_slice(opening, 0);
+
+        assert_eq!(
+            resolve_region(&region),
+            expect,
+            "the closing fold over the reference ring is part of the digest"
+        );
+    }
+
+    #[test]
+    fn a_registered_reference_row_influences_the_final_digest() {
+        // Two regions differing only in the opening row of the last column —
+        // the one the ring's newest entry names.
         let mut biom_a = Vec::new();
         let mut biom_b = Vec::new();
-        for i in 0..9u8 {
-            let fill = if i == 8 { 1 } else { i };
-            biom_a.extend(one_column_biom(i, 0, [i; GRID_EDGE * GRID_EDGE]));
-            biom_b.extend(one_column_biom(i, 0, [fill; GRID_EDGE * GRID_EDGE]));
+        for i in 0..3u8 {
+            let mut cells_a = [i; GRID_EDGE * GRID_EDGE];
+            let mut cells_b = cells_a;
+            if i == 2 {
+                cells_a[1] = 9;
+                cells_b[1] = 10;
+            }
+            biom_a.extend(one_column_biom(i, 0, cells_a));
+            biom_b.extend(one_column_biom(i, 0, cells_b));
         }
-        let a = region_with_biom(9, &biom_a);
-        let b = region_with_biom(9, &biom_b);
+        let a = region_with_biom(3, &biom_a);
+        let b = region_with_biom(3, &biom_b);
         let ra = crate::parse::parse(&a).expect("valid region");
         let rb = crate::parse::parse(&b).expect("valid region");
-        assert_ne!(
-            resolve_region(&ra),
-            resolve_region(&rb),
-            "changing the retained column's cells must change the digest"
-        );
+        assert_ne!(resolve_region(&ra), resolve_region(&rb));
     }
 }

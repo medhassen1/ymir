@@ -1,19 +1,19 @@
 //! Component interpretation.
 //!
-//! [`crate::entity`] owns the region-lifetime component arena; this module
+//! [`crate::entity`] owns the region-lifetime component store; this module
 //! knows how to read a component out of it. The reader takes a raw `(pointer,
 //! len)` pair rather than a borrowed slice, so a region-wide fold walks every
-//! retained component through one pointer instead of re-borrowing the arena
-//! per entity.
+//! watched component through one pointer instead of re-borrowing the store per
+//! entity.
 
 use crate::entity::Kind;
 
 /// Read one component and fold it into a digest word.
 ///
-/// `cursor` addresses the component arena; `offset` and `len` locate the slot
-/// inside it; `kind` fixes how the bytes are interpreted.
+/// `cursor` addresses a component's payload in the store; `offset` and `len`
+/// locate the bytes inside it; `kind` fixes how they are interpreted.
 ///
-/// SAFETY: `cursor` must address an arena in which `offset .. offset + len` is
+/// SAFETY: `cursor` must address a run in which `offset .. offset + len` is
 /// live and initialised for the duration of the call.
 pub fn read_component(cursor: *const u8, offset: usize, len: usize, kind: Kind) -> u64 {
     if cursor.is_null() || len == 0 {

@@ -62,15 +62,15 @@ pub fn attenuate(origin: *const LightNode, face: u8) -> u8 {
     level.saturating_sub(cost)
 }
 
-/// Fold a digest of a column frontier retained in the region's [`crate::light`]
-/// node arena.
+/// Fold a digest of a column frontier committed to the region's
+/// [`crate::light`] node arena.
 ///
 /// [`crate::light::propagate_region`] commits every column's expanded frontier
-/// into a region-lifetime arena, and a frontier that reached far enough is
-/// kept as a retained cross-column bleed source so the region's closing pass
-/// can fold it again once every column has had its own turn. This is that
-/// pass's read: `ptr`/`len` name the committed span directly, walked through
-/// raw pointer arithmetic rather than a bounds-checked index.
+/// into a region-lifetime arena and offers it as a cross-column bleed source,
+/// so the region's closing pass can fold it again once every column has had its
+/// own turn. This is that pass's read: `ptr`/`len` name the committed span
+/// directly, walked through raw pointer arithmetic rather than a bounds-checked
+/// index.
 ///
 /// SAFETY: `ptr` must address at least `len` live [`LightNode`] values for the
 /// call.

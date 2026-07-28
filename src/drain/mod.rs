@@ -40,15 +40,14 @@ fn rank_against(e: &TickEntry, base: &TickEntry) -> u64 {
     dt.wrapping_mul(31).wrapping_add(dp).wrapping_add(e.sub_order as u64)
 }
 
-/// Fold a digest of a retained round's fired entries, read from the region's
-/// entry pool.
+/// Fold a digest of a carried round's fired entries, read from the buffer the
+/// drain staged it in.
 ///
-/// [`crate::tick::drain_region`] drains the due queue in rounds, committing
-/// each round's entries into a region-lifetime pool, and a busy round is kept
-/// as a retained cross-round anchor so the region's closing pass can rank it
-/// again once every round has fired. This is that pass's read: `ptr`/`len`
-/// name the committed span directly, walked through raw pointer arithmetic
-/// rather than a bounds-checked index.
+/// [`crate::tick::drain_region`] cuts the due queue into rounds and stages each
+/// into one of two alternating buffers, carrying it as a cross-round anchor so
+/// the region's closing pass can rank it again once every round has fired.
+/// This is that pass's read: `ptr`/`len` name the staged span directly, walked
+/// through raw pointer arithmetic rather than a bounds-checked index.
 ///
 /// SAFETY: `ptr` must address at least `len` live [`TickEntry`] values for the
 /// call.

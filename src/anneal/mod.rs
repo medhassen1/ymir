@@ -1,14 +1,14 @@
 //! Relight folding.
 //!
-//! [`crate::relight`] owns the region-lifetime slab ring; this module folds
-//! what it committed. The anneal pass smooths a merged run of columns so that
-//! a light discontinuity at a merge boundary does not show up as a visible
-//! seam.
+//! [`crate::relight`] owns the region-lifetime slab pool; this module folds
+//! what it packed. The anneal pass smooths a merged run of columns so that a
+//! light discontinuity at a merge boundary does not show up as a visible seam.
 
-/// Fold one column's committed levels into a digest word.
+/// Fold one column's packed levels into a digest word.
 ///
-/// `ptr`/`count` name a column's packed levels, however they are currently
-/// held — resolved fresh from the ring or read back from a retained span.
+/// `ptr`/`count` name a column's packed levels, however the caller came by
+/// them — the slab a column was just issued, or one resolved again for a
+/// deferred neighbour.
 ///
 /// SAFETY: `ptr` must address at least `count` live levels for the call.
 pub fn fold_one(ptr: *const u8, count: usize) -> u64 {

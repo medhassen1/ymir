@@ -7,18 +7,20 @@
 //! pass touches each column several times and re-indexing dominated the profile.
 //!
 //! A region's height pass rebuilds one column's map at a time, but a slope
-//! reading is more useful with a neighbour to compare against, so a handful of
-//! columns spaced across the region keep their map's span registered in a
-//! retained list for the rest of the pass — see [`RETAIN_STRIDE`] in
-//! [`rebuild_region`]. That only works if a column's map outlives the column
-//! itself, which is what [`HeightArena`] is for: built once per region rather
-//! than once per column, it appends every column's finished map into
-//! fixed-size chunks and hands back a pointer into them instead of an owned
-//! buffer. Because the arena lives for the whole pass, its memory is bounded
-//! separately from any one column's lifetime: once the accumulated volume
-//! crosses a threshold, [`HeightArena::compact`] drops the oldest chunks, the
-//! way a buffer pool reclaims cold pages instead of growing without bound on a
-//! region with many columns.
+//! reading is more useful with a neighbour to compare against, so recent
+//! columns keep their map's span registered as landmarks for later columns to
+//! measure against — see [`LandmarkRing`]. That only works if a column's map
+//! outlives the column itself, which is what [`HeightArena`] is for: built once
+//! per region rather than once per column, it bump-appends every column's
+//! finished map into fixed-size chunks and hands back a pointer into them
+//! instead of an owned buffer.
+//!
+//! The pass runs in waves: a column whose map needed no overflow rows is flat
+//! terrain and closes out the wave the taller columns before it opened. The
+//! arena takes a watermark at each such boundary and rewinds its bump pointer
+//! there when the next one arrives, handing back the chunks the intervening
+//! columns forced — see [`HeightArena::rewind`]. That is the arena's bound: a
+//! region of ordinary terrain never carries more than a wave's worth of maps.
 
 use crate::chunk::{self, linear_index, Column};
 use crate::common::*;
@@ -115,43 +117,49 @@ impl HeightMap {
 /// past the chunk it lands in.
 const ARENA_CHUNK_UNITS: usize = 4 * MAP_AREA;
 
-/// Accumulated resident columns across an arena's live chunks that triggers
-/// [`HeightArena::compact`].
+/// Chunks a single wave may reach before [`HeightArena::rewind`] gives up.
 ///
-/// An ordinary region's height pass — a modest number of columns, most flat —
-/// never approaches this. A region built from many tall, heavily overflowing
-/// columns does, which is exactly the case the bound exists to catch: without
-/// it, a region-lifetime arena would keep every column's map resident for the
-/// whole pass no matter how many columns the region carries.
-const COMPACT_THRESHOLD_UNITS: usize = 16 * MAP_AREA;
+/// Rewinding reuses the space above the watermark for the next wave, which pays
+/// only while a wave fits inside the chunk the watermark sits in. A region
+/// whose waves have needed a chunk beyond it has outgrown the scheme — every
+/// rewind would be undone by the very next commit — so the arena stops and
+/// keeps what it has.
+const REWIND_MAX_CHUNKS: usize = 1;
 
-/// Spacing between columns that register a retained map span.
-///
-/// The first column has no earlier neighbour to compare against, so retention
-/// starts at the first multiple of the stride past it.
-const RETAIN_STRIDE: usize = 8;
+/// Slots in [`LandmarkRing`].
+const LANDMARK_SLOTS: usize = 4;
 
 /// A region-lifetime arena for finished column heightmaps.
 ///
 /// Built once per region rather than once per column, so a span handed out
-/// while rebuilding one column's map stays valid while later columns are
-/// rebuilt — which is what lets a retained map span (see [`rebuild_region`])
-/// be read again well after its own column has finished. Columns are appended
-/// into fixed-size chunks, each stored as an exact-sized boxed slice; a chunk
-/// with no room left for the next commit is left as-is and a fresh one takes
-/// over, so a single column's map is never split across two chunks.
+/// while rebuilding one column's map stays meaningful while later columns are
+/// rebuilt — which is what lets a landmark (see [`rebuild_region`]) be read
+/// again well after its own column has finished. Columns are bump-appended into
+/// fixed-size chunks, each stored as an exact-sized boxed slice; a chunk with no
+/// room left for the next commit is left as-is and a fresh one takes over, so a
+/// single column's map is never split across two chunks.
 struct HeightArena {
     /// Chunks holding committed column data, oldest first.
     chunks: Vec<Box<[u16]>>,
     /// Columns already written into the last chunk.
     used: usize,
-    /// Columns held across all currently resident chunks.
-    resident: usize,
+    /// The bump position the next [`HeightArena::rewind`] returns to: how many
+    /// chunks were open at the last wave boundary, and how far into the last of
+    /// them the arena had written.
+    mark: (usize, usize),
+    /// The most chunks the arena has ever held at once.
+    peak_chunks: usize,
 }
 
 impl HeightArena {
     fn new() -> HeightArena {
-        HeightArena { chunks: Vec::new(), used: 0, resident: 0 }
+        HeightArena { chunks: Vec::new(), used: 0, mark: (0, 0), peak_chunks: 0 }
+    }
+
+    /// Columns held across every chunk the arena currently holds.
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
     }
 
     /// Commit a column's map into the arena and return a pointer to where it
@@ -159,8 +167,8 @@ impl HeightArena {
     ///
     /// If what remains of the current chunk cannot hold `cols`, a fresh chunk
     /// takes over first, so the returned pointer's `cols.len()` entries are
-    /// always contiguous — addressing live memory for as long as the chunk
-    /// backing them stays resident (see [`HeightArena::compact`]).
+    /// always contiguous — addressing live memory for as long as the arena's
+    /// bump pointer stays past them (see [`HeightArena::rewind`]).
     fn commit(&mut self, cols: &[u16]) -> *const u16 {
         let len = cols.len();
         let fits_current = self.chunks.last().is_some_and(|c| self.used + len <= c.len());
@@ -168,7 +176,7 @@ impl HeightArena {
             let cap = len.max(ARENA_CHUNK_UNITS);
             self.chunks.push(vec![0u16; cap].into_boxed_slice());
             self.used = 0;
-            self.resident += cap;
+            self.peak_chunks = self.peak_chunks.max(self.chunks.len());
         }
         let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
         chunk[self.used..self.used + len].copy_from_slice(cols);
@@ -181,29 +189,65 @@ impl HeightArena {
         ptr
     }
 
-    /// Drop the oldest resident chunks until the arena's accumulated columns
-    /// fall back to `threshold`, or only the chunk currently being written to
-    /// is left.
+    /// Take a watermark here: this is where the next wave starts, and where a
+    /// later [`HeightArena::rewind`] returns to.
+    fn mark(&mut self) {
+        self.mark = (self.chunks.len(), self.used);
+    }
+
+    /// Return the bump pointer to the last watermark, releasing every chunk
+    /// opened past it.
     ///
-    /// This is the arena's memory bound: left unchecked, a region-lifetime
-    /// arena would keep every column's map resident for the whole pass no
-    /// matter how many columns the region carries. The chunk currently being
-    /// written to is never dropped, since the next commit needs somewhere to
-    /// land.
-    fn compact(&mut self, threshold: usize) {
-        while self.resident > threshold && self.chunks.len() > 1 {
-            let oldest = self.chunks.remove(0);
-            self.resident -= oldest.len();
+    /// This is the arena's bound. The maps of a finished wave have had their
+    /// slopes folded and nothing after the wave asks for them again, so the next
+    /// wave writes over the same span instead of the arena growing once per
+    /// column for the length of the region.
+    ///
+    /// A wave that needed a chunk beyond the watermark's has outgrown the
+    /// scheme — rewinding would be undone by the next commit — so past
+    /// [`REWIND_MAX_CHUNKS`] the arena keeps its chunks and simply carries on.
+    fn rewind(&mut self) {
+        if self.peak_chunks > REWIND_MAX_CHUNKS {
+            return;
         }
+        // Releases every chunk opened since the watermark was taken.
+        self.chunks.truncate(self.mark.0);
+        self.used = self.mark.1;
     }
 }
 
-/// A column's map span retained past its own turn through [`rebuild_region`]'s
-/// main loop, for the closing profile pass to read once the whole region has
-/// been walked.
-struct RetainedSpan {
+/// A column's map span, named for later columns and the closing profile pass to
+/// measure slope against.
+struct Landmark {
     ptr: *const u16,
     rows: usize,
+}
+
+/// The map spans [`rebuild_region`] profiles once more at the end of the pass.
+///
+/// Fixed capacity, reused round-robin: every column offers its map as a
+/// landmark, and the ring keeps the most recent few so the closing pass costs
+/// the same on a region of four columns and one of four thousand.
+struct LandmarkRing {
+    slots: [Option<Landmark>; LANDMARK_SLOTS],
+    next: usize,
+}
+
+impl LandmarkRing {
+    fn new() -> LandmarkRing {
+        LandmarkRing { slots: [None, None, None, None], next: 0 }
+    }
+
+    /// Put `landmark` in the next slot, displacing whatever that slot held.
+    fn offer(&mut self, landmark: Landmark) {
+        self.slots[self.next] = Some(landmark);
+        self.next = (self.next + 1) % LANDMARK_SLOTS;
+    }
+
+    /// The landmarks currently held, oldest slot first.
+    fn landmarks(&self) -> impl Iterator<Item = &Landmark> {
+        self.slots.iter().flatten()
+    }
 }
 
 /// Scan one column's sections and record the highest solid block per position.
@@ -256,14 +300,17 @@ fn overflow_is_solid(col: &Column) -> bool {
 /// Rebuild the heightmap for every column and fold a digest of the result.
 ///
 /// Each column's finished map is committed into a region-wide [`HeightArena`]
-/// rather than freed with the column: a spaced-out subset of columns keep
-/// their map's span registered in a retained list for the rest of the pass,
-/// giving a later column a cross-region neighbour to measure slope against
-/// beyond just its immediate predecessor. The row count handed to the
-/// profiler is always the map's actual row count — never a predicted span the
-/// map's storage may not have actually grown to — so the profiler never reads
-/// past what a column really committed. The retained spans are profiled once
-/// more at the end, closing out the pass.
+/// rather than freed with the column, and offered to the [`LandmarkRing`],
+/// giving a later column a neighbour to measure slope against beyond just its
+/// immediate predecessor. The row count handed to the profiler is always the
+/// map's actual row count — never a predicted span the map's storage may not
+/// have actually grown to — so the profiler never reads past what a column
+/// really committed. The ring's landmarks are profiled once more at the end,
+/// closing out the pass.
+///
+/// A column that needed no overflow rows is flat terrain and closes out the
+/// wave the taller columns before it opened, so the arena rewinds to the
+/// watermark taken at the previous boundary and takes a fresh one here.
 pub fn rebuild_region(region: &Region, n: usize) -> u64 {
     // The `hgts` section supplies a per-region bias applied to every column.
     let bias = {
@@ -272,7 +319,7 @@ pub fn rebuild_region(region: &Region, n: usize) -> u64 {
     };
 
     let mut arena = HeightArena::new();
-    let mut retained: Vec<RetainedSpan> = Vec::new();
+    let mut landmarks = LandmarkRing::new();
     let mut acc = 0xffu64 ^ (bias as i64 as u64);
 
     for cid in 0..n {
@@ -293,30 +340,32 @@ pub fn rebuild_region(region: &Region, n: usize) -> u64 {
             map.extend_span(extra);
         }
 
+        // A map that stayed at its base span is flat terrain: the wave the
+        // taller columns before it opened ends here, so the arena returns to
+        // the watermark that wave started from.
+        let wave_boundary = map.rows() == MAP_EDGE;
+        if wave_boundary {
+            arena.rewind();
+        }
+
         // Commit this column's finished map into the region's arena. Only
-        // past this point is there a pointer stable enough to retain past
-        // this column's own scope. The row count committed is the map's own
-        // — whatever it actually grew to, never a larger predicted span.
+        // past this point is there a pointer stable enough to name past this
+        // column's own scope. The row count committed is the map's own —
+        // whatever it actually grew to, never a larger predicted span.
         let rows = map.rows();
         let ptr = arena.commit(map.columns());
         acc = acc.wrapping_mul(0x100000001b3) ^ profile::slope_sum(ptr, rows, MAP_EDGE, bias);
+        landmarks.offer(Landmark { ptr, rows });
 
-        // Every `RETAIN_STRIDE`-th column past the first keeps its map span
-        // alive as a neighbour for later columns to measure slope against,
-        // giving the region continuity beyond just each column's immediate
-        // predecessor.
-        if cid > 0 && cid % RETAIN_STRIDE == 0 {
-            retained.push(RetainedSpan { ptr, rows });
+        if wave_boundary {
+            // The next wave starts from here.
+            arena.mark();
         }
-
-        // Bound the arena's resident memory now that this column's map is
-        // safely committed.
-        arena.compact(COMPACT_THRESHOLD_UNITS);
     }
 
-    // Close out the pass by profiling every retained span once.
-    for r in &retained {
-        acc = acc.wrapping_mul(0x100000001b3) ^ profile::slope_sum(r.ptr, r.rows, MAP_EDGE, bias);
+    // Close out the pass by profiling every landmark the ring holds.
+    for l in landmarks.landmarks() {
+        acc = acc.wrapping_mul(0x100000001b3) ^ profile::slope_sum(l.ptr, l.rows, MAP_EDGE, bias);
     }
 
     acc
@@ -431,8 +480,8 @@ mod tests {
         let mut arena = HeightArena::new();
         let a = arena.commit(&[1, 2, 3, 4]);
         let b = arena.commit(&[5, 6]);
-        // SAFETY: neither chunk has been compacted away, so both pointers
-        // still address the entries just committed.
+        // SAFETY: the bump pointer has only moved forward since both were
+        // committed, so both still address the entries just written.
         unsafe {
             assert_eq!(std::slice::from_raw_parts(a, 4), [1, 2, 3, 4]);
             assert_eq!(std::slice::from_raw_parts(b, 2), [5, 6]);
@@ -450,31 +499,47 @@ mod tests {
     }
 
     #[test]
-    fn compact_leaves_a_small_arena_untouched() {
+    fn rewinding_without_a_watermark_empties_the_arena() {
         let mut arena = HeightArena::new();
         arena.commit(&[1, 2, 3]);
-        arena.compact(COMPACT_THRESHOLD_UNITS);
+        assert_eq!(arena.capacity(), ARENA_CHUNK_UNITS);
+        arena.rewind();
+        assert_eq!(arena.capacity(), 0, "nothing was marked, so nothing is kept");
+        assert_eq!(arena.used, 0);
+    }
+
+    #[test]
+    fn rewinding_returns_the_bump_pointer_to_the_watermark() {
+        let mut arena = HeightArena::new();
+        arena.commit(&[1, 2, 3]);
+        arena.mark();
+        arena.commit(&[4, 5, 6, 7]);
+        assert_eq!(arena.used, 7);
+        arena.rewind();
+        assert_eq!(arena.used, 3, "the wave after the watermark is reusable space");
         assert_eq!(arena.chunks.len(), 1);
     }
 
     #[test]
-    fn compact_drops_oldest_chunks_once_over_threshold() {
+    fn rewinding_stops_once_a_wave_outgrows_its_chunk() {
         let mut arena = HeightArena::new();
-        for _ in 0..6 {
-            arena.commit(&vec![0u16; ARENA_CHUNK_UNITS]);
-        }
-        assert_eq!(arena.chunks.len(), 6);
-        arena.compact(3 * ARENA_CHUNK_UNITS);
-        assert!(arena.chunks.len() < 6, "compact must drop some chunks");
-        assert!(arena.resident <= 3 * ARENA_CHUNK_UNITS);
+        arena.commit(&[1, 2, 3]);
+        arena.mark();
+        // A wave that needs a second chunk has outgrown the scheme.
+        arena.commit(&vec![0u16; ARENA_CHUNK_UNITS]);
+        assert_eq!(arena.chunks.len(), 2);
+        arena.rewind();
+        assert_eq!(arena.chunks.len(), 2, "the arena must keep what it has");
     }
 
     #[test]
-    fn compact_never_drops_the_last_chunk() {
-        let mut arena = HeightArena::new();
-        arena.commit(&[1, 2, 3]);
-        arena.compact(0);
-        assert_eq!(arena.chunks.len(), 1, "the chunk being written to must survive");
+    fn landmark_ring_holds_only_its_newest_slots() {
+        let mut ring = LandmarkRing::new();
+        let cols = [1u16, 2, 3, 4];
+        for _ in 0..LANDMARK_SLOTS + 3 {
+            ring.offer(Landmark { ptr: cols.as_ptr(), rows: 1 });
+        }
+        assert_eq!(ring.landmarks().count(), LANDMARK_SLOTS, "capacity must be fixed");
     }
 
     /// Build a minimal region with a flat, single-section column repeated

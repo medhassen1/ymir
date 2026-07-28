@@ -101,16 +101,16 @@ pub fn triangulate(table: &WeldTable) -> Vec<u32> {
     indices
 }
 
-/// Fold a digest of a column mesh retained in the region's [`crate::mesh`]
+/// Fold a digest of a column mesh committed to the region's [`crate::mesh`]
 /// vertex arena.
 ///
 /// [`crate::mesh::build_region`] commits every column's finished mesh into a
-/// region-lifetime arena, and a column whose mesh is large enough is kept as a
-/// retained boundary reference so the region's closing seam pass can fold it
-/// again once every column has had its own turn through the loop. This is
-/// that pass's read: `ptr`/`len` name the committed span directly, walked
-/// through raw pointer arithmetic rather than a bounds-checked index, so nothing
-/// here depends on `Vec`'s own capacity bookkeeping.
+/// region-lifetime arena and offers it as a boundary reference, so the region's
+/// closing seam pass can fold it again once every column has had its own turn
+/// through the loop. This is that pass's read: `ptr`/`len` name the committed
+/// span directly, walked through raw pointer arithmetic rather than a
+/// bounds-checked index, so nothing here depends on `Vec`'s own capacity
+/// bookkeeping.
 ///
 /// SAFETY: `ptr` must address at least `len` live [`Vertex`] values for the
 /// call.

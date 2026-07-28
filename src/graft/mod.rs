@@ -76,16 +76,15 @@ pub fn stamp_all(
     acc
 }
 
-/// Fold a digest of a retained parent template's cells.
+/// Fold a digest of a positioning anchor's cells.
 ///
-/// [`crate::structure::instance_region`] commits every top-level template's
-/// decoded cells into a region-lifetime arena, and a template large enough to
-/// anchor nested placements against is kept as a retained parent so the
-/// region's closing pass can fold it again once every template has had its
-/// own turn — the way a village's houses are placed relative to the village
-/// origin. This is that pass's read: `cells`/`len` name the committed span
-/// directly, walked through raw pointer arithmetic rather than a
-/// bounds-checked index.
+/// [`crate::structure::instance_region`] stages every template's resolved
+/// cells into a region-lifetime arena and registers them as a positioning
+/// anchor, so the region's closing pass can fold them again once every
+/// template has had its own turn — the way a village's houses are placed
+/// relative to the village origin. This is that pass's read: `cells`/`len`
+/// name the staged span directly, walked through raw pointer arithmetic rather
+/// than a bounds-checked index.
 ///
 /// SAFETY: `cells` must address at least `len` live [`Cell`] values for the
 /// call.

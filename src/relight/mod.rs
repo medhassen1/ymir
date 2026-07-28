@@ -3,17 +3,21 @@
 //! When only part of a region changed, relighting every column is wasteful. The
 //! incremental pass rebuilds light for the dirty columns only.
 //!
-//! The pass keeps its packed level buffers in a region-lifetime [`SlabRing`]
-//! rather than one allocation per column: built once for the whole incremental
-//! pass, it recycles a fixed set of slabs round-robin, the way a double- (or
-//! N-fold-) buffered renderer reuses a small pool of frames instead of
-//! allocating a fresh one every time. A handful of columns, spaced across the
-//! dirty set, keep their slab's span registered in a deferred fold list so a
+//! The pass packs its level buffers into slabs drawn from a region-lifetime
+//! [`SlabPool`] rather than allocating one buffer per column. A column's slab
+//! stays out while later columns might still anneal against it; once
+//! [`IN_FLIGHT_SLABS`] are out, the oldest goes back on the pool's free list
+//! and the next column that asks is issued it again. Recycling is what keeps
+//! the pass's allocation count flat over a heavily dirtied region instead of
+//! growing one slab per dirty column.
+//!
+//! A spaced-out subset of columns leave their slab with a [`DeferRing`], so a
 //! later column's anneal can measure against a neighbour beyond just its
-//! immediate predecessor — see [`RETAIN_STRIDE`] in [`incremental`]. Because
-//! the ring is a fixed size, a dirty set larger than it wraps back to the
-//! first slab and overwrites it, the way a ring buffer always has, no matter
-//! how many columns still hold that slab's span in the deferred list.
+//! immediate predecessor — see [`DEFER_STRIDE`]. The ring's capacity is fixed
+//! rather than one entry per column, so what the closing anneal costs is
+//! bounded by the ring rather than by how many columns the region marks dirty.
+
+use std::collections::VecDeque;
 
 use crate::anneal;
 use crate::chunk::{self, Column};
@@ -53,108 +57,171 @@ pub fn column_levels(col: &Column) -> Vec<u8> {
     levels
 }
 
-/// Slabs held by the ring at once.
+/// Slabs the pass keeps in flight before handing the oldest back.
 ///
-/// An ordinary incremental relight touches only a few dirty columns, well
-/// under this, so an ordinary pass never wraps. A region marking many columns
-/// dirty at once does, which is exactly the case the ring exists to bound:
-/// without a fixed size, a region-lifetime pool of level slabs would grow
-/// without bound on a heavily-dirtied region.
-const RING_SIZE: usize = 8;
+/// An ordinary incremental relight touches fewer dirty columns than this, so
+/// its slabs are never recycled at all. A region marking many columns dirty at
+/// once goes past it, which is exactly the case the cap exists to bound:
+/// without it, the pool would hold one slab per dirty column for the whole
+/// pass.
+const IN_FLIGHT_SLABS: usize = 6;
 
-/// Spacing between dirty columns that register a retained slab span.
+/// How much larger than the column that takes it a reissued slab may be and
+/// still be used as it stands.
 ///
-/// The first column has no earlier neighbour to anneal against, so retention
-/// starts at the first multiple of the stride past it.
-const RETAIN_STRIDE: usize = 3;
+/// Columns differ in how many sections carry light, so the slab a column hands
+/// back is rarely exactly the size the next one needs. Tolerating a section's
+/// worth of slack avoids refitting on every reissue; anything further off is
+/// refitted, so the pool does not keep the largest column's slab resident for
+/// the rest of the pass.
+const SLAB_SLACK: usize = SECTION_EDGE * SECTION_EDGE;
 
-/// A ring of reusable level slabs, region-lifetime across the whole
-/// incremental pass.
+/// Spacing between dirty columns that leave their slab with the ring.
+const DEFER_STRIDE: usize = 3;
+
+/// Deferred neighbours the ring keeps at once.
 ///
-/// The first [`RING_SIZE`] columns each claim a fresh slot; every commit after
-/// that overwrites the next slot in ring order, dropping whatever slab was
-/// resident there and replacing it with a freshly allocated, exact-sized one —
-/// the way a fixed-size ring buffer always recycles its oldest entry rather
-/// than growing.
-struct SlabRing {
-    slots: Vec<Box<[u8]>>,
+/// Four is enough for the closing anneal to reach back over a handful of
+/// deferrals while keeping its cost independent of the dirty set's size.
+const DEFER_SLOTS: usize = 4;
+
+/// A region-lifetime pool of packed level slabs.
+///
+/// A slab is issued to a column, and handed back once the pass has moved far
+/// enough past it (see [`IN_FLIGHT_SLABS`]) for the next column to take.
+/// Slabs are addressed by index rather than by pointer, so a caller that
+/// outlives one issue can resolve the slab it borrowed afresh instead of
+/// holding a pointer across the pass.
+struct SlabPool {
+    /// Every slab the pool has allocated, in issue order.
+    slabs: Vec<Box<[u8]>>,
+    /// Indices of the slabs currently handed back.
+    free: Vec<usize>,
+}
+
+impl SlabPool {
+    fn new() -> SlabPool {
+        SlabPool { slabs: Vec::new(), free: Vec::new() }
+    }
+
+    /// Pack `levels` into a slab and return that slab's index.
+    ///
+    /// A slab from the free list is used as it stands when it is large enough
+    /// for `levels` and no more than [`SLAB_SLACK`] larger; otherwise it is
+    /// refitted to exactly what this column needs. With nothing free, the pool
+    /// allocates.
+    fn issue(&mut self, levels: &[u8]) -> usize {
+        if let Some(idx) = self.free.pop() {
+            let held = self.slabs[idx].len();
+            if held < levels.len() || held > levels.len() + SLAB_SLACK {
+                self.slabs[idx] = levels.to_vec().into_boxed_slice();
+            } else {
+                self.slabs[idx][..levels.len()].copy_from_slice(levels);
+            }
+            return idx;
+        }
+        self.slabs.push(levels.to_vec().into_boxed_slice());
+        self.slabs.len() - 1
+    }
+
+    /// Hand slab `idx` back for a later column to take.
+    fn release(&mut self, idx: usize) {
+        self.free.push(idx);
+    }
+
+    /// A pointer to the first level of slab `idx`.
+    fn base(&self, idx: usize) -> *const u8 {
+        self.slabs[idx].as_ptr()
+    }
+}
+
+/// A column's slab left with the ring for the closing anneal to fold, once the
+/// whole dirty set has been walked.
+struct Deferred {
+    /// The slab this column's levels were packed into.
+    slab: usize,
+    /// How many levels this column contributed. A slab can be larger than the
+    /// column that took it (see [`SLAB_SLACK`]), so the count is what bounds
+    /// the fold rather than the slab's own length.
+    count: usize,
+}
+
+/// A fixed-capacity ring of deferred neighbours.
+///
+/// Deferring takes the next slot in round-robin order, displacing whatever was
+/// deferred [`DEFER_SLOTS`] deferrals ago. Bounding the ring is what keeps the
+/// pass's deferred state — and the closing anneal's cost — flat over a heavily
+/// dirtied region, instead of growing one entry per deferral the way a plain
+/// list would.
+struct DeferRing {
+    slots: [Option<Deferred>; DEFER_SLOTS],
     next: usize,
 }
 
-impl SlabRing {
-    fn new() -> SlabRing {
-        SlabRing { slots: Vec::new(), next: 0 }
+impl DeferRing {
+    fn new() -> DeferRing {
+        DeferRing { slots: Default::default(), next: 0 }
     }
 
-    /// Commit `levels` into the ring and return a pointer to where they
-    /// landed.
-    ///
-    /// The returned pointer addresses `levels.len()` live bytes for as long as
-    /// the slot backing it has not yet been recycled for a later column (see
-    /// [`SlabRing::commit`]'s wrap behaviour above).
-    fn commit(&mut self, levels: &[u8]) -> *const u8 {
-        let slab: Box<[u8]> = levels.to_vec().into_boxed_slice();
-        if self.slots.len() < RING_SIZE {
-            self.slots.push(slab);
-            self.next = self.slots.len() % RING_SIZE;
-            // SAFETY: the slab was just pushed and is exactly `levels.len()`
-            // bytes long.
-            self.slots.last().unwrap().as_ptr()
-        } else {
-            let idx = self.next;
-            self.slots[idx] = slab;
-            self.next = (idx + 1) % RING_SIZE;
-            // SAFETY: the slab was just written into `slots[idx]` and is
-            // exactly `levels.len()` bytes long.
-            self.slots[idx].as_ptr()
-        }
+    /// Leave `neighbour` as the newest deferred fold.
+    fn defer(&mut self, neighbour: Deferred) {
+        self.slots[self.next] = Some(neighbour);
+        self.next = (self.next + 1) % DEFER_SLOTS;
     }
-}
 
-/// A column's slab span retained past its own turn through [`incremental`]'s
-/// main loop, for the closing anneal fold to read once the whole dirty set has
-/// been walked.
-struct RetainedSlab {
-    ptr: *const u8,
-    count: usize,
+    /// The neighbours the ring currently holds, in slot order.
+    fn neighbours(&self) -> impl Iterator<Item = &Deferred> {
+        self.slots.iter().flatten()
+    }
 }
 
 /// Relight the region's dirty columns and fold a digest of the result.
 ///
-/// Each column's packed levels are committed into a region-wide [`SlabRing`]
-/// rather than freed with the column: a spaced-out subset of columns keep
-/// their slab's span registered in a retained list for the rest of the pass,
+/// Each column's packed levels are issued a slab from the region's
+/// [`SlabPool`], folded, and left in flight while later columns are relit. A
+/// spaced-out subset of columns also leave their slab with the [`DeferRing`],
 /// giving a later column's anneal a cross-region neighbour beyond just its
-/// immediate predecessor. The retained spans are folded once more at the end,
-/// closing out the pass.
+/// immediate predecessor. The neighbours the ring still holds are folded once
+/// more at the end, closing out the pass.
 pub fn incremental(region: &Region, n: usize) -> u64 {
     let dirty = dirty_columns(region, n);
     if dirty.is_empty() {
         return 0;
     }
 
-    let mut ring = SlabRing::new();
-    let mut retained: Vec<RetainedSlab> = Vec::new();
+    let mut pool = SlabPool::new();
+    let mut ring = DeferRing::new();
+    let mut in_flight: VecDeque<usize> = VecDeque::new();
     let mut acc = 0xffu64;
 
     for (i, col) in dirty.iter().enumerate() {
         let levels = column_levels(col);
         let count = levels.len();
-        let ptr = ring.commit(&levels);
-        acc = acc.wrapping_mul(0x100000001b3) ^ anneal::fold_one(ptr, count);
+        let slab = pool.issue(&levels);
+        acc = acc.wrapping_mul(0x100000001b3) ^ anneal::fold_one(pool.base(slab), count);
 
-        // Every `RETAIN_STRIDE`-th column past the first keeps its slab's span
-        // alive as a neighbour for a later column's anneal to read, giving the
-        // pass continuity beyond just each column's immediate predecessor.
-        if i > 0 && i % RETAIN_STRIDE == 0 {
-            retained.push(RetainedSlab { ptr, count });
+        // Every `DEFER_STRIDE`-th column leaves its slab for the closing
+        // anneal to fold, giving the pass continuity beyond just each column's
+        // immediate predecessor.
+        if i % DEFER_STRIDE == 0 {
+            ring.defer(Deferred { slab, count });
+        }
+
+        // This column's slab stays out while later columns might still anneal
+        // against it; once the pass is far enough past the oldest one, it goes
+        // back for the next column to take.
+        in_flight.push_back(slab);
+        if in_flight.len() > IN_FLIGHT_SLABS {
+            if let Some(oldest) = in_flight.pop_front() {
+                pool.release(oldest);
+            }
         }
     }
 
-    // Close out the pass by folding in every retained slab once, now that the
-    // whole dirty set has gone through the ring.
-    for r in &retained {
-        acc = acc.wrapping_mul(0x100000001b3) ^ anneal::fold_one(r.ptr, r.count);
+    // Close out the pass by folding every deferred neighbour once, resolving
+    // its slab afresh now that the whole dirty set has been walked.
+    for d in ring.neighbours() {
+        acc = acc.wrapping_mul(0x100000001b3) ^ anneal::fold_one(pool.base(d.slab), d.count);
     }
     acc
 }
@@ -191,25 +258,61 @@ mod tests {
     }
 
     #[test]
-    fn ring_commit_writes_are_readable_back() {
-        let mut ring = SlabRing::new();
-        let a = ring.commit(&[1, 2, 3]);
-        let b = ring.commit(&[4, 5]);
-        // SAFETY: the ring has not wrapped (only two commits, well under
-        // `RING_SIZE`), so neither slot has been overwritten.
+    fn pool_issues_a_fresh_slab_while_nothing_is_free() {
+        let mut pool = SlabPool::new();
+        let a = pool.issue(&[1, 2, 3]);
+        let b = pool.issue(&[4, 5]);
+        assert_ne!(a, b);
+        assert_eq!(pool.slabs.len(), 2);
+        // SAFETY: both slabs hold exactly what was just packed into them.
         unsafe {
-            assert_eq!(std::slice::from_raw_parts(a, 3), [1, 2, 3]);
-            assert_eq!(std::slice::from_raw_parts(b, 2), [4, 5]);
+            assert_eq!(std::slice::from_raw_parts(pool.base(a), 3), [1, 2, 3]);
+            assert_eq!(std::slice::from_raw_parts(pool.base(b), 2), [4, 5]);
         }
     }
 
     #[test]
-    fn ring_reuses_slots_only_after_wrapping() {
-        let mut ring = SlabRing::new();
-        for _ in 0..RING_SIZE {
-            ring.commit(&[9]);
+    fn a_released_slab_is_reissued() {
+        let mut pool = SlabPool::new();
+        let a = pool.issue(&[1, 2, 3]);
+        pool.release(a);
+        let b = pool.issue(&[7, 8, 9]);
+        assert_eq!(a, b, "the free slab must be taken rather than a fresh one");
+        assert_eq!(pool.slabs.len(), 1);
+    }
+
+    #[test]
+    fn a_reissued_slab_within_slack_keeps_its_size() {
+        let mut pool = SlabPool::new();
+        let a = pool.issue(&vec![1u8; SLAB_SLACK]);
+        pool.release(a);
+        // One byte shorter: well inside the slack, so the slab is used as it
+        // stands rather than refitted.
+        let b = pool.issue(&vec![2u8; SLAB_SLACK - 1]);
+        assert_eq!(a, b);
+        assert_eq!(pool.slabs[b].len(), SLAB_SLACK);
+    }
+
+    #[test]
+    fn a_reissued_slab_far_off_size_is_refitted() {
+        let mut pool = SlabPool::new();
+        let a = pool.issue(&vec![1u8; 4 * SLAB_SLACK]);
+        pool.release(a);
+        let b = pool.issue(&vec![2u8; SLAB_SLACK]);
+        assert_eq!(a, b);
+        assert_eq!(pool.slabs[b].len(), SLAB_SLACK, "the slab must be refitted to the column");
+    }
+
+    #[test]
+    fn defer_ring_holds_only_its_newest_entries() {
+        let mut ring = DeferRing::new();
+        for slab in 0..DEFER_SLOTS + 2 {
+            ring.defer(Deferred { slab, count: slab });
         }
-        assert_eq!(ring.slots.len(), RING_SIZE, "the ring must fill before it wraps");
+        assert_eq!(ring.neighbours().count(), DEFER_SLOTS);
+        let mut slabs: Vec<usize> = ring.neighbours().map(|d| d.slab).collect();
+        slabs.sort_unstable();
+        assert_eq!(slabs, vec![2, 3, 4, 5]);
     }
 
     #[test]

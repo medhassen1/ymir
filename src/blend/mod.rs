@@ -7,10 +7,10 @@
 //!
 //! [`mix_row`] has two call sites in [`crate::biome::resolve_region`]: once per
 //! row as each column is decoded, and once more at the end of the region's
-//! pass for every row a column retained as a cross-column reference. Both
-//! calls share the same contract — the caller names a live `(pointer, length)`
-//! pair — since this module has no way to tell which kind of call it is
-//! looking at.
+//! pass for every row its reference ring still holds as a cross-column
+//! reference. Both calls share the same contract — the caller names a live
+//! `(pointer, length)` pair — since this module has no way to tell which kind
+//! of call it is looking at.
 
 /// Weights of the horizontal three-tap kernel, in sixteenths.
 const KERNEL: [u32; 3] = [4, 8, 4];

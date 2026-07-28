@@ -85,17 +85,17 @@ fn rebuild_is_deterministic() {
 
 #[test]
 fn golden_seccache() {
-    assert_eq!(digest("seccache_ok"), 0x49223931e6aa5ece);
+    assert_eq!(digest("seccache_ok"), 0xa6a73bfb15d4f789);
 }
 
 #[test]
 fn golden_mesh() {
-    assert_eq!(digest("mesh_ok"), 0x6f7ab85f4ac1f876);
+    assert_eq!(digest("mesh_ok"), 0x9a3376c4b9e012e4);
 }
 
 #[test]
 fn golden_light() {
-    assert_eq!(digest("light_ok"), 0x0001c36eff63b14d);
+    assert_eq!(digest("light_ok"), 0x66b0629756d0d7fb);
 }
 
 #[test]
@@ -105,37 +105,37 @@ fn golden_entity() {
 
 #[test]
 fn golden_tile() {
-    assert_eq!(digest("tile_ok"), 0x01a4ac319093411f);
+    assert_eq!(digest("tile_ok"), 0xc3e0d2e5add3aebf);
 }
 
 #[test]
 fn golden_height() {
-    assert_eq!(digest("height_ok"), 0x0000f9000001a70b);
+    assert_eq!(digest("height_ok"), 0x034e260002ced7a1);
 }
 
 #[test]
 fn golden_biome() {
-    assert_eq!(digest("biome_ok"), 0x42c5b1073fd3dd5a);
+    assert_eq!(digest("biome_ok"), 0x49cb7d0e3c130f6b);
 }
 
 #[test]
 fn golden_struct() {
-    assert_eq!(digest("struct_ok"), 0xbf52d68f6742b028);
+    assert_eq!(digest("struct_ok"), 0x033badf4655239a1);
 }
 
 #[test]
 fn golden_tick() {
-    assert_eq!(digest("tick_ok"), 0x0116e383e926a2f9);
+    assert_eq!(digest("tick_ok"), 0x01adbd85aab683f1);
 }
 
 #[test]
 fn golden_relight() {
-    assert_eq!(digest("relight_ok"), 0x0000ff000001b04d);
+    assert_eq!(digest("relight_ok"), 0x03619a0002de93d7);
 }
 
 #[test]
 fn golden_palette() {
-    assert_eq!(digest("palette_ok"), 0xa13eea04e3730e98);
+    assert_eq!(digest("palette_ok"), 0x09f5cbfca1d9a328);
 }
 
 /// The VERIFY bit selects no stage, so it must rebuild exactly as the default

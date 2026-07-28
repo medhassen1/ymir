@@ -7,17 +7,20 @@
 //! region's on-disk savings come from.
 //!
 //! A region's repack pass compresses one section's table at a time, but the
-//! entries are committed into a region-lifetime [`PaletteArena`] rather than
-//! freed with the section: built once per region rather than once per
-//! section, it appends every section's compressed entries into fixed-size
-//! chunks and hands back a pointer into them instead of an owned buffer. A
-//! handful of sections, spaced across the region, keep their span registered
-//! in a retained list for the rest of the pass. Because the arena lives for
-//! the whole pass, its memory is bounded separately from any one section's
-//! lifetime: once the accumulated entry count crosses a threshold,
-//! [`PaletteArena::compact`] drops the oldest chunks, the way a buffer pool
-//! reclaims cold pages instead of growing without bound on a region with many
-//! distinct palettes.
+//! entries are committed into a region-lifetime [`EntryPool`] rather than
+//! freed with the section: built once per region rather than once per section,
+//! it appends every section's compressed entries into one contiguous run and
+//! hands back a pointer into it instead of an owned buffer. Keeping the run
+//! contiguous is what lets a span be read as a slice with no chunk lookup in
+//! the way; the pool pays for that by growing the way a vector does — a larger
+//! buffer, the entries moved into it, the old one released — which doubling
+//! keeps to a logarithmic number of times over a region with many distinct
+//! palettes.
+//!
+//! Every section registers its span with a [`SharedRing`] of fixed capacity, so
+//! what the closing fold costs — and how many spans the pass keeps addressable
+//! — is bounded by the ring rather than by how many sections the region
+//! carries.
 
 use crate::chunk::{self, Column};
 use crate::common::*;
@@ -141,111 +144,117 @@ pub fn used_indices(blocks: &[u16], palette_len: usize) -> Vec<bool> {
     used
 }
 
-/// Entries held by one [`PaletteArena`] chunk.
-///
-/// An ordinary section's compressed palette — a handful of block states —
-/// fits with room to spare, so an ordinary commit never has to look past the
-/// chunk it lands in.
-const ARENA_CHUNK_UNITS: usize = 256;
-
-/// Accumulated resident entries across an arena's live chunks that triggers
-/// [`PaletteArena::compact`].
+/// Entries a fresh [`EntryPool`] holds.
 ///
 /// An ordinary region's repack pass — a modest number of sections, most
-/// carrying a small palette — never approaches this. A region built from many
-/// sections with wide, distinct palettes does, which is exactly the case the
-/// bound exists to catch: without it, a region-lifetime arena would keep
-/// every section's compressed entries resident for the whole pass no matter
-/// how many sections the region carries.
-const COMPACT_THRESHOLD_UNITS: usize = 1024;
+/// carrying a small palette — commits fewer entries than this in total, so the
+/// pool never has to grow at all. A region built from many sections with wide,
+/// distinct palettes does, which is exactly what the growth path exists for.
+const POOL_INIT_UNITS: usize = 256;
 
-/// Spacing between sections that register a retained palette span.
+/// Shared palette spans the ring keeps addressable at once.
 ///
-/// The first section has no earlier neighbour to share against, so retention
-/// starts at the first multiple of the stride past it.
-const RETAIN_STRIDE: usize = 8;
+/// Four is enough to give the closing fold a cross-region term reaching back
+/// over a handful of sections while keeping its cost — and the spans it holds
+/// on to — independent of the region's section count.
+const SHARED_SLOTS: usize = 4;
 
-/// A region-lifetime arena for compressed palette entries.
+/// A region-lifetime pool for compressed palette entries.
 ///
 /// Built once per region rather than once per section, so a span handed out
-/// while repacking one section stays valid while later sections are repacked
-/// — which is what lets a retained palette span (see [`repack_region`]) be
-/// read again well after its own section has finished. Entries are appended
-/// into fixed-size chunks, each stored as an exact-sized boxed slice; a chunk
-/// with no room left for the next commit is left as-is and a fresh one takes
-/// over, so a single section's table is never split across two chunks.
-struct PaletteArena {
-    /// Chunks holding committed entries, oldest first.
-    chunks: Vec<Box<[u16]>>,
-    /// Entries already written into the last chunk.
+/// while repacking one section stays valid while later sections are repacked —
+/// which is what lets a shared palette span (see [`repack_region`]) be read
+/// again well after its own section has finished. Entries live in one
+/// contiguous run rather than a chain of chunks, so a span is a slice with no
+/// chunk lookup in the way and no section's table is ever split.
+///
+/// The pool pays for that by growing the way a vector does: a larger buffer,
+/// the entries moved into it, the old one released. Growth at least doubles,
+/// so a region with many sections grows a logarithmic number of times rather
+/// than once per section.
+struct EntryPool {
+    /// The committed entries, back to back from index zero.
+    entries: Box<[u16]>,
+    /// How much of `entries` the committed spans occupy.
     used: usize,
-    /// Entries held across all currently resident chunks.
-    resident: usize,
 }
 
-impl PaletteArena {
-    fn new() -> PaletteArena {
-        PaletteArena { chunks: Vec::new(), used: 0, resident: 0 }
+impl EntryPool {
+    fn new() -> EntryPool {
+        EntryPool { entries: vec![0u16; POOL_INIT_UNITS].into_boxed_slice(), used: 0 }
     }
 
-    /// Commit `entries` into the arena and return a pointer to where they
+    /// Commit `entries` into the pool and return a pointer to where they
     /// landed.
     ///
-    /// If what remains of the current chunk cannot hold `entries`, a fresh
-    /// chunk takes over first, so the returned pointer's `entries.len()`
-    /// values are always contiguous — addressing live memory for as long as
-    /// the chunk backing them stays resident (see [`PaletteArena::compact`]).
+    /// The returned pointer's `entries.len()` values are contiguous, and
+    /// address live memory for as long as the buffer holding them is the
+    /// pool's own.
     fn commit(&mut self, entries: &[u16]) -> *const u16 {
-        let len = entries.len();
-        let fits_current = self.chunks.last().is_some_and(|c| self.used + len <= c.len());
-        if !fits_current {
-            let cap = len.max(ARENA_CHUNK_UNITS);
-            self.chunks.push(vec![0u16; cap].into_boxed_slice());
-            self.used = 0;
-            self.resident += cap;
+        if self.used + entries.len() > self.entries.len() {
+            self.grow(entries.len());
         }
-        let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
-        chunk[self.used..self.used + len].copy_from_slice(entries);
-        // SAFETY: `chunk` is a live `Box<[u16]>` at least `self.used + len`
-        // entries long — either it already fit `entries` past `self.used`, or
-        // a chunk sized to hold at least `entries` was just pushed — so this
-        // offset and the `len` entries from it lie inside the allocation.
-        let ptr = unsafe { chunk.as_ptr().add(self.used) };
-        self.used += len;
-        ptr
+        let start = self.used;
+        self.entries[start..start + entries.len()].copy_from_slice(entries);
+        self.used += entries.len();
+        // SAFETY: the copy above wrote `entries.len()` values starting at
+        // `start`, so `start` is an index inside this allocation.
+        unsafe { self.entries.as_ptr().add(start) }
     }
 
-    /// Drop the oldest resident chunks until the arena's accumulated entries
-    /// fall back to `threshold`, or only the chunk currently being written to
-    /// is left.
-    ///
-    /// This is the arena's memory bound: left unchecked, a region-lifetime
-    /// arena would keep every section's entries resident for the whole pass
-    /// no matter how many sections the region carries. The chunk currently
-    /// being written to is never dropped, since the next commit needs
-    /// somewhere to land.
-    fn compact(&mut self, threshold: usize) {
-        while self.resident > threshold && self.chunks.len() > 1 {
-            let oldest = self.chunks.remove(0);
-            self.resident -= oldest.len();
-        }
+    /// Take a larger buffer, at least big enough for a commit of `need`
+    /// entries, and move what the pool holds into it.
+    fn grow(&mut self, need: usize) {
+        let want = (self.used + need).max(self.entries.len() * 2);
+        let mut grown = vec![0u16; want].into_boxed_slice();
+        grown[..self.used].copy_from_slice(&self.entries[..self.used]);
+        self.entries = grown;
     }
 }
 
-/// A section's compressed palette span retained past its own turn through
-/// [`repack_region`]'s main loop, for the closing fold to read once the whole
-/// region has been walked.
-struct RetainedPalette {
+/// A section's compressed palette span, registered with the region's
+/// [`SharedRing`] for the closing fold to read once the whole region has been
+/// walked.
+struct SharedSpan {
     ptr: *const u16,
     len: usize,
     width: u8,
     savings: u8,
 }
 
+/// A fixed-capacity ring of shared palette spans.
+///
+/// Registering a span takes the next slot in round-robin order, displacing
+/// whatever was registered [`SHARED_SLOTS`] sections ago. Bounding the ring is
+/// what keeps the pass's cross-section state — and the closing fold's cost —
+/// flat over a region with many sections, instead of growing one entry per
+/// section the way a plain list would.
+struct SharedRing {
+    slots: [Option<SharedSpan>; SHARED_SLOTS],
+    next: usize,
+}
+
+impl SharedRing {
+    fn new() -> SharedRing {
+        SharedRing { slots: Default::default(), next: 0 }
+    }
+
+    /// Register `span` as the newest shared palette span.
+    fn register(&mut self, span: SharedSpan) {
+        self.slots[self.next] = Some(span);
+        self.next = (self.next + 1) % SHARED_SLOTS;
+    }
+
+    /// The spans the ring currently holds, in slot order.
+    fn spans(&self) -> impl Iterator<Item = &SharedSpan> {
+        self.slots.iter().flatten()
+    }
+}
+
 /// Bit-pack entries read from a raw span into their fingerprint bytes.
 ///
 /// Mirrors [`PaletteTable::pack_bytes`], but reads its entries through a
-/// pointer rather than an owned slice, for the region-lifetime arena path.
+/// pointer rather than an owned slice, for the region-lifetime pool path.
 ///
 /// SAFETY: `ptr` must address at least `len` live entries for the call.
 fn pack_bytes_from(ptr: *const u16, len: usize, width: u8) -> Vec<u8> {
@@ -304,16 +313,14 @@ pub fn repack_column(col: &Column) -> u64 {
 /// Repack every palette in the region and fold a digest of the result.
 ///
 /// Each section's compressed entries are committed into a region-wide
-/// [`PaletteArena`] rather than freed with the section: a spaced-out subset of
-/// sections keep their span registered in a retained list for the rest of the
-/// pass, giving the digest a cross-region term beyond each section's own
-/// immediate fold. The retained spans are folded once more at the end,
-/// closing out the pass.
+/// [`EntryPool`] rather than freed with the section, and its span is registered
+/// with the region's [`SharedRing`], giving the digest a cross-region term
+/// beyond each section's own immediate fold. The spans the ring still holds are
+/// folded once more at the end, closing out the pass.
 pub fn repack_region(region: &Region, n: usize) -> u64 {
-    let mut arena = PaletteArena::new();
-    let mut retained: Vec<RetainedPalette> = Vec::new();
+    let mut pool = EntryPool::new();
+    let mut shared = SharedRing::new();
     let mut acc = 0xffu64;
-    let mut sidx = 0usize;
 
     for cid in 0..n {
         let col = match chunk::decode(region, cid) {
@@ -326,8 +333,8 @@ pub fn repack_region(region: &Region, n: usize) -> u64 {
 
         // Each column folds its own sections starting from a fresh seed,
         // mirroring `repack_column`, then that result folds into the region
-        // digest — the arena and its retained spans are the only things a
-        // column shares with the rest of the pass.
+        // digest — the pool and its shared spans are the only things a column
+        // shares with the rest of the pass.
         let mut inner = 0xffu64 ^ (col.cid as u64);
         for s in &col.sections {
             if s.palette.is_empty() {
@@ -342,10 +349,10 @@ pub fn repack_region(region: &Region, n: usize) -> u64 {
             let width = table.width;
             let savings = table.savings_from(original_width);
 
-            // Commit this section's finished entries into the region's
-            // arena. Only past this point is there a pointer stable enough to
-            // retain past this section's own scope.
-            let ptr = arena.commit(table.entries());
+            // Commit this section's finished entries into the region's pool.
+            // Only past this point is there a pointer stable enough to share
+            // past this section's own scope.
+            let ptr = pool.commit(table.entries());
             let len = table.len();
 
             let packed = pack_bytes_from(ptr, len, width);
@@ -353,27 +360,21 @@ pub fn repack_region(region: &Region, n: usize) -> u64 {
             inner = inner.wrapping_mul(0x100000001b3)
                 ^ repack::fold_entries(packed.as_ptr(), count, savings);
 
-            // Every `RETAIN_STRIDE`-th section past the first keeps its span
-            // alive as a reference for the rest of the pass, giving the
-            // region continuity beyond just each section's immediate use.
-            if sidx > 0 && sidx % RETAIN_STRIDE == 0 {
-                retained.push(RetainedPalette { ptr, len, width, savings });
-            }
-            sidx += 1;
-
-            // Bound the arena's resident memory now that this section's
-            // entries are safely committed.
-            arena.compact(COMPACT_THRESHOLD_UNITS);
+            // Register this section's span as the newest shared reference,
+            // giving the region continuity beyond just each section's
+            // immediate use.
+            shared.register(SharedSpan { ptr, len, width, savings });
         }
 
         acc = acc.wrapping_mul(0x100000001b3) ^ inner;
     }
 
-    // Close out the pass by folding in every retained span once.
-    for r in &retained {
-        let packed = pack_bytes_from(r.ptr, r.len, r.width);
-        let count = repack::packed_bytes(r.len, r.width);
-        acc = acc.wrapping_mul(0x100000001b3) ^ repack::fold_entries(packed.as_ptr(), count, r.savings);
+    // Close out the pass by folding in every span the ring holds.
+    for s in shared.spans() {
+        let packed = pack_bytes_from(s.ptr, s.len, s.width);
+        let count = repack::packed_bytes(s.len, s.width);
+        acc =
+            acc.wrapping_mul(0x100000001b3) ^ repack::fold_entries(packed.as_ptr(), count, s.savings);
     }
 
     acc
@@ -456,12 +457,12 @@ mod tests {
     }
 
     #[test]
-    fn arena_commit_writes_are_readable_back() {
-        let mut arena = PaletteArena::new();
-        let a = arena.commit(&[1, 2, 3, 4]);
-        let b = arena.commit(&[5, 6]);
-        // SAFETY: neither chunk has been compacted away, so both pointers
-        // still address the entries just committed.
+    fn pool_commit_writes_are_readable_back() {
+        let mut pool = EntryPool::new();
+        let a = pool.commit(&[1, 2, 3, 4]);
+        let b = pool.commit(&[5, 6]);
+        // SAFETY: the pool has not grown (two tiny commits, far below its
+        // initial size), so both pointers still address what was committed.
         unsafe {
             assert_eq!(std::slice::from_raw_parts(a, 4), [1, 2, 3, 4]);
             assert_eq!(std::slice::from_raw_parts(b, 2), [5, 6]);
@@ -469,49 +470,52 @@ mod tests {
     }
 
     #[test]
-    fn arena_starts_a_new_chunk_once_the_current_one_is_full() {
-        let mut arena = PaletteArena::new();
-        let filler = vec![0u16; ARENA_CHUNK_UNITS - 4];
-        arena.commit(&filler);
-        assert_eq!(arena.chunks.len(), 1);
-        arena.commit(&[1, 2, 3, 4, 5]);
-        assert_eq!(arena.chunks.len(), 2);
-    }
-
-    #[test]
-    fn compact_leaves_a_small_arena_untouched() {
-        let mut arena = PaletteArena::new();
-        arena.commit(&[1, 2, 3]);
-        arena.compact(COMPACT_THRESHOLD_UNITS);
-        assert_eq!(arena.chunks.len(), 1);
-    }
-
-    #[test]
-    fn compact_drops_oldest_chunks_once_over_threshold() {
-        let mut arena = PaletteArena::new();
-        for _ in 0..6 {
-            arena.commit(&vec![0u16; ARENA_CHUNK_UNITS]);
+    fn a_small_region_never_grows_the_pool() {
+        let mut pool = EntryPool::new();
+        for _ in 0..8 {
+            pool.commit(&[1, 2, 3, 4]);
         }
-        assert_eq!(arena.chunks.len(), 6);
-        arena.compact(3 * ARENA_CHUNK_UNITS);
-        assert!(arena.chunks.len() < 6, "compact must drop some chunks");
-        assert!(arena.resident <= 3 * ARENA_CHUNK_UNITS);
+        assert_eq!(pool.entries.len(), POOL_INIT_UNITS);
+        assert_eq!(pool.used, 32);
     }
 
     #[test]
-    fn compact_never_drops_the_last_chunk() {
-        let mut arena = PaletteArena::new();
-        arena.commit(&[1, 2, 3]);
-        arena.compact(0);
-        assert_eq!(arena.chunks.len(), 1, "the chunk being written to must survive");
+    fn the_pool_grows_once_outgrown() {
+        let mut pool = EntryPool::new();
+        pool.commit(&vec![7u16; POOL_INIT_UNITS - 2]);
+        assert_eq!(pool.entries.len(), POOL_INIT_UNITS);
+        pool.commit(&[1, 2, 3, 4, 5]);
+        assert!(pool.entries.len() >= POOL_INIT_UNITS * 2, "growth at least doubles");
+        assert_eq!(pool.used, POOL_INIT_UNITS + 3);
+    }
+
+    #[test]
+    fn growth_carries_the_committed_entries_over() {
+        let mut pool = EntryPool::new();
+        pool.commit(&[9, 8, 7]);
+        pool.commit(&vec![1u16; POOL_INIT_UNITS]);
+        assert_eq!(&pool.entries[..3], &[9u16, 8, 7]);
+    }
+
+    #[test]
+    fn shared_ring_holds_only_its_newest_entries() {
+        let mut ring = SharedRing::new();
+        let entries = [1u16, 2, 3];
+        for len in 1..=(SHARED_SLOTS + 2) {
+            ring.register(SharedSpan { ptr: entries.as_ptr(), len, width: 4, savings: 0 });
+        }
+        assert_eq!(ring.spans().count(), SHARED_SLOTS);
+        let mut lens: Vec<usize> = ring.spans().map(|s| s.len).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![3, 4, 5, 6]);
     }
 
     #[test]
     fn pack_bytes_from_matches_the_owned_path() {
         let entries = [1u16, 2, 3, 4, 5];
         let width = width_for(entries.len());
-        let mut arena = PaletteArena::new();
-        let ptr = arena.commit(&entries);
+        let mut pool = EntryPool::new();
+        let ptr = pool.commit(&entries);
         let via_ptr = pack_bytes_from(ptr, entries.len(), width);
 
         let t = PaletteTable::new(entries.to_vec());

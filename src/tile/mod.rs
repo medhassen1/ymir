@@ -7,14 +7,14 @@
 //!
 //! The interner is region-lifetime: built once for the whole `tile` section
 //! rather than once per tree, so a span handed out while decoding one property
-//! stays meaningful to read back once every tree has been walked. Names are
-//! appended into fixed-size chunks (see [`NameArena`]) rather than one
-//! ever-growing string, and the store bounds its resident memory the way a
-//! buffer pool reclaims cold pages: once accumulated name bytes cross a
-//! threshold, [`NameArena::compact`] drops the oldest chunks, because a region
-//! naming many distinct properties would otherwise keep every name resident for
-//! the whole decode no matter how many trees it carries. [`decode_region`]
-//! renders every property's name only once the whole section has been decoded.
+//! stays meaningful to read back once every tree has been walked. Names live in
+//! one contiguous run (see [`NameArena`]) rather than a chain of chunks, so a
+//! name is always a single span and a lookup never has to care which block it
+//! landed in. The run is grown against a load factor rather than allocated for
+//! the worst case, which is what keeps a region naming a handful of properties
+//! from reserving for one naming thousands. [`decode_region`] renders each
+//! property as it is decoded, and reads a small deferred set of them once more
+//! after the whole section has been walked.
 
 use crate::common::*;
 use crate::parse::Region;
@@ -61,98 +61,95 @@ pub struct Prop {
     pub depth: u32,
 }
 
-/// Bytes held by one [`NameArena`] chunk.
+/// Bytes a [`NameArena`] reserves the first time anything is interned.
 ///
-/// An ordinary property name is a handful of bytes, so a typical commit never
-/// has to look past the chunk it lands in.
-const ARENA_CHUNK_BYTES: usize = 512;
+/// A tile section that names only the handful of properties every tile entity
+/// carries never needs more than this.
+const ARENA_INITIAL_BYTES: usize = 64;
 
-/// Accumulated resident bytes across an arena's live chunks that triggers
-/// [`NameArena::compact`].
+/// Load factor, in eighths, the arena is grown at.
 ///
-/// An ordinary region's tile section — a modest set of recurring property
-/// names — never approaches this. A region naming many distinct properties
-/// does, which is exactly the case the bound exists to catch: without it, a
-/// region-lifetime arena would keep every name resident for the whole decode
-/// no matter how many distinct names the section carries.
-const COMPACT_THRESHOLD_BYTES: usize = 2048;
+/// Growing before the run is actually full is what keeps the growth amortised:
+/// a run filled to the brim would be relocated by the very next name.
+const ARENA_LOAD_EIGHTHS: usize = 6;
+
+/// Slots in [`DeferredSet`].
+const DEFER_SLOTS: usize = 3;
 
 /// A region-lifetime arena for interned property name bytes.
 ///
 /// Built once per `tile` section rather than once per tree, so a span handed
-/// out while decoding one property stays valid while later properties are
-/// decoded — which is what lets [`Prop::name_ptr`] be read again well after
-/// its own property has finished. Bytes are appended into fixed-size chunks,
-/// each stored as an exact-sized boxed slice; a chunk with no room left for
-/// the next commit is left as-is and a fresh one takes over, so a single name
-/// is never split across two chunks.
+/// out while decoding one property stays meaningful while later properties are
+/// decoded — which is what lets [`Prop::name_ptr`] be read again well after its
+/// own property has finished.
+///
+/// The arena is one contiguous run rather than a chain of chunks, so a name is
+/// always a single span and a lookup never has to work out which block a name
+/// landed in. Growing therefore means relocating: a larger run is allocated,
+/// the bytes already interned are copied across, and the old run is released.
+/// The load factor is what keeps that rare — the run is grown before it fills
+/// and its size doubles, so the copies are amortised over the names interned.
 struct NameArena {
-    /// Chunks holding committed name bytes, oldest first.
-    chunks: Vec<Box<[u8]>>,
-    /// Bytes already written into the last chunk.
+    /// The interned name bytes, exactly as long as the run reserved.
+    bytes: Box<[u8]>,
+    /// Bytes already written.
     used: usize,
-    /// Bytes held across all currently resident chunks.
-    resident: usize,
 }
 
 impl NameArena {
     fn new() -> NameArena {
-        NameArena { chunks: Vec::new(), used: 0, resident: 0 }
+        NameArena { bytes: Vec::new().into_boxed_slice(), used: 0 }
     }
 
-    /// Commit `bytes` into the arena and return a pointer to where they
-    /// landed.
-    ///
-    /// If what remains of the current chunk cannot hold `bytes`, a fresh chunk
-    /// takes over first, so the returned pointer's `bytes.len()` bytes are
-    /// always contiguous — addressing live memory for as long as the chunk
-    /// backing them stays resident (see [`NameArena::compact`]).
-    fn commit(&mut self, bytes: &[u8]) -> *const u8 {
-        let len = bytes.len();
-        let fits_current = self.chunks.last().is_some_and(|c| self.used + len <= c.len());
-        if !fits_current {
-            let cap = len.max(ARENA_CHUNK_BYTES);
-            self.chunks.push(vec![0u8; cap].into_boxed_slice());
-            self.used = 0;
-            self.resident += cap;
-        }
-        let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
-        chunk[self.used..self.used + len].copy_from_slice(bytes);
-        // SAFETY: `chunk` is a live `Box<[u8]>` at least `self.used + len`
-        // bytes long — either it already fit `bytes` past `self.used`, or a
-        // chunk sized to hold at least `bytes` was just pushed — so this
-        // offset and the `len` bytes from it lie inside the allocation.
-        let ptr = unsafe { chunk.as_ptr().add(self.used) };
-        self.used += len;
-        ptr
+    /// Bytes the arena's current run can hold.
+    fn capacity(&self) -> usize {
+        self.bytes.len()
     }
 
-    /// Drop the oldest resident chunks until the arena's accumulated bytes
-    /// fall back to `threshold`, or only the chunk currently being written to
-    /// is left.
-    ///
-    /// This is the arena's memory bound: left unchecked, a region-lifetime
-    /// arena would keep every name resident for the whole decode no matter
-    /// how many distinct properties the section carries. The chunk currently
-    /// being written to is never dropped, since the next commit needs
-    /// somewhere to land.
-    fn compact(&mut self, threshold: usize) {
-        while self.resident > threshold && self.chunks.len() > 1 {
-            let oldest = self.chunks.remove(0);
-            self.resident -= oldest.len();
+    /// Make sure `want` further bytes fit under the load factor, relocating the
+    /// run to a larger one if they do not.
+    fn reserve(&mut self, want: usize) {
+        if (self.used + want) * 8 <= self.capacity() * ARENA_LOAD_EIGHTHS {
+            return;
         }
+        let mut cap = self.capacity().max(ARENA_INITIAL_BYTES / 2) * 2;
+        while (self.used + want) * 8 > cap * ARENA_LOAD_EIGHTHS {
+            cap *= 2;
+        }
+        let mut grown = vec![0u8; cap].into_boxed_slice();
+        grown[..self.used].copy_from_slice(&self.bytes[..self.used]);
+        // Releases the run the names were copied out of.
+        self.bytes = grown;
+    }
+
+    /// Commit `bytes` into the arena and return the offset they landed at.
+    fn commit(&mut self, bytes: &[u8]) -> usize {
+        self.reserve(bytes.len());
+        let at = self.used;
+        self.bytes[at..at + bytes.len()].copy_from_slice(bytes);
+        self.used = at + bytes.len();
+        at
+    }
+
+    /// The address `at` bytes into the arena's current run.
+    fn address(&self, at: usize) -> *const u8 {
+        // SAFETY: `at` is an offset this arena handed out, so it is at most
+        // `self.used`, which is at most the run's length — and offsetting a
+        // live allocation by at most its own length is in bounds.
+        unsafe { self.bytes.as_ptr().add(at) }
     }
 }
 
 /// An interner over the region-lifetime [`NameArena`].
 ///
 /// Deduplication is checked against `known`, a set of owned copies kept
-/// entirely separate from the arena — so a lookup never depends on whether an
-/// earlier name's arena chunk is still resident, only the arena-backed span it
-/// hands back does.
+/// entirely separate from the arena, alongside each name's offset into the run.
+/// Holding offsets rather than addresses is what lets the store keep answering
+/// correctly across a growth: a lookup resolves against wherever the run
+/// currently lives.
 pub struct NameStore {
     arena: NameArena,
-    known: Vec<(String, *const u8, usize)>,
+    known: Vec<(String, usize, usize)>,
 }
 
 impl NameStore {
@@ -172,32 +169,33 @@ impl NameStore {
     }
 
     /// Bytes of name payload interned so far, counting every distinct name
-    /// once regardless of how many of the arena's chunks are still resident.
+    /// once regardless of how large a run the arena currently holds.
     pub fn bytes(&self) -> usize {
         self.known.iter().map(|(s, _, _)| s.len()).sum()
+    }
+
+    /// Bytes the arena's run currently reserves.
+    pub fn reserved(&self) -> usize {
+        self.arena.capacity()
     }
 
     /// Intern `name`, returning its `(pointer, len)` span into the arena. An
     /// identical name that is already present is shared rather than committed
     /// again.
     pub fn intern(&mut self, name: &str) -> (*const u8, usize) {
-        if let Some(&(_, ptr, len)) = self.known.iter().find(|(k, _, _)| k == name) {
-            return (ptr, len);
+        if let Some(&(_, at, len)) = self.known.iter().find(|(k, _, _)| k == name) {
+            return (self.arena.address(at), len);
         }
-        let ptr = self.arena.commit(name.as_bytes());
-        let len = name.len();
-        self.known.push((name.to_string(), ptr, len));
-        // Bound the arena's resident memory now that this name is safely
-        // committed.
-        self.arena.compact(COMPACT_THRESHOLD_BYTES);
-        (ptr, len)
+        let at = self.arena.commit(name.as_bytes());
+        self.known.push((name.to_string(), at, name.len()));
+        (self.arena.address(at), name.len())
     }
 
     /// The interned name at a span, for tests and diagnostics.
     ///
     /// SAFETY: `ptr`/`len` must still address live bytes in the arena — true
-    /// for a span read back before enough further names have been interned to
-    /// compact away the chunk holding it.
+    /// for a span read back before the arena has grown past the run it was
+    /// handed out of.
     pub fn get(&self, ptr: *const u8, len: usize) -> &str {
         if ptr.is_null() || len == 0 {
             return "";
@@ -234,8 +232,44 @@ impl Tree {
     }
 }
 
+/// The properties [`decode_region`]'s closing pass renders a second time.
+///
+/// Rendering a property once as it is decoded and once at the end is what gives
+/// the digest a term that depends on the section as a whole rather than on each
+/// tree in isolation. Fixed capacity, reused round-robin: a region may carry
+/// thousands of properties and the closing pass has to cost the same on all of
+/// them, so the newest displace the oldest instead of the set growing with the
+/// section.
+struct DeferredSet {
+    slots: [Option<Prop>; DEFER_SLOTS],
+    next: usize,
+}
+
+impl DeferredSet {
+    fn new() -> DeferredSet {
+        DeferredSet { slots: [None; DEFER_SLOTS], next: 0 }
+    }
+
+    /// Put `prop` in the next slot, displacing whatever that slot held.
+    fn defer(&mut self, prop: Prop) {
+        self.slots[self.next] = Some(prop);
+        self.next = (self.next + 1) % DEFER_SLOTS;
+    }
+
+    /// The properties currently held, oldest slot first.
+    fn props(&self) -> impl Iterator<Item = &Prop> {
+        self.slots.iter().flatten()
+    }
+}
+
+/// The digest state a decode threads through the tree.
+struct Fold {
+    acc: u64,
+    deferred: DeferredSet,
+}
+
 /// Decode one property subtree, recursing into compounds.
-fn decode_subtree(c: &mut Cursor, tree: &mut Tree, depth: u32, budget: &mut usize) {
+fn decode_subtree(c: &mut Cursor, tree: &mut Tree, depth: u32, budget: &mut usize, fold: &mut Fold) {
     if depth > 8 || *budget == 0 {
         return;
     }
@@ -281,19 +315,25 @@ fn decode_subtree(c: &mut Cursor, tree: &mut Tree, depth: u32, budget: &mut usiz
             ValueKind::Compound => 0,
         };
 
-        tree.props.push(Prop { name_ptr, name_len, kind, value, depth });
+        let prop = Prop { name_ptr, name_len, kind, value, depth };
+        tree.props.push(prop);
+        // Render the property here, against the span the interner just handed
+        // back, and offer it to the deferred set for the closing pass.
+        fold.acc = fold.acc.wrapping_mul(0x100000001b3) ^ resolve::render_prop(&prop);
+        fold.deferred.defer(prop);
 
         if kind == ValueKind::Compound {
-            decode_subtree(c, tree, depth + 1, budget);
+            decode_subtree(c, tree, depth + 1, budget, fold);
         }
     }
 }
 
 /// Decode the region's tile-entity trees and fold a digest of them.
 ///
-/// Every property is decoded — and every name interned — before any of them
-/// are rendered: the render pass is one closing loop over `tree.props`, read
-/// only once the whole section has gone through the interner.
+/// Each property is rendered as it is decoded, and a small deferred set of them
+/// is rendered once more after the whole section has gone through the interner
+/// — giving the digest a term that covers the section as a whole rather than
+/// each tree on its own.
 pub fn decode_region(region: &Region) -> u64 {
     let data = region.slice(region.tile);
     if data.is_empty() {
@@ -302,16 +342,17 @@ pub fn decode_region(region: &Region) -> u64 {
     let mut c = Cursor::new(data);
     let mut tree = Tree { props: Vec::new(), names: NameStore::new() };
     let mut budget = MAX_PROPS;
+    let mut fold = Fold { acc: 0xffu64, deferred: DeferredSet::new() };
 
     // Seed the store with the names every tile entity carries, so the common
     // case interns nothing further while the tree is walked.
     for common in ["id", "x", "y", "z", "Items"] {
         tree.names.intern(common);
     }
-    decode_subtree(&mut c, &mut tree, 0, &mut budget);
+    decode_subtree(&mut c, &mut tree, 0, &mut budget, &mut fold);
 
-    let mut acc = 0xffu64;
-    for p in &tree.props {
+    let mut acc = fold.acc;
+    for p in fold.deferred.props() {
         acc = acc.wrapping_mul(0x100000001b3) ^ resolve::render_prop(p);
     }
     acc
@@ -390,9 +431,11 @@ mod tests {
         let mut c = Cursor::new(&bytes);
         let mut tree = Tree { props: Vec::new(), names: NameStore::new() };
         let mut budget = 16usize;
-        decode_subtree(&mut c, &mut tree, 0, &mut budget);
+        let mut fold = Fold { acc: 0xffu64, deferred: DeferredSet::new() };
+        decode_subtree(&mut c, &mut tree, 0, &mut budget, &mut fold);
         assert_eq!(tree.props.len(), 16);
         assert_eq!(budget, 0);
+        assert_eq!(fold.deferred.props().count(), DEFER_SLOTS);
     }
 
     #[test]
@@ -415,50 +458,66 @@ mod tests {
         let mut arena = NameArena::new();
         let a = arena.commit(b"abcd");
         let b = arena.commit(b"ef");
-        // SAFETY: neither chunk has been compacted away, so both pointers
-        // still address the bytes just committed.
+        // SAFETY: the arena has not grown since either offset was handed out,
+        // so both address the bytes just committed.
         unsafe {
-            assert_eq!(std::slice::from_raw_parts(a, 4), b"abcd");
-            assert_eq!(std::slice::from_raw_parts(b, 2), b"ef");
+            assert_eq!(std::slice::from_raw_parts(arena.address(a), 4), b"abcd");
+            assert_eq!(std::slice::from_raw_parts(arena.address(b), 2), b"ef");
         }
     }
 
     #[test]
-    fn arena_starts_a_new_chunk_once_the_current_one_is_full() {
+    fn arena_reserves_its_initial_run_on_first_use() {
         let mut arena = NameArena::new();
-        let filler = vec![0u8; ARENA_CHUNK_BYTES - 4];
-        arena.commit(&filler);
-        assert_eq!(arena.chunks.len(), 1);
-        arena.commit(&[1, 2, 3, 4, 5]);
-        assert_eq!(arena.chunks.len(), 2);
-    }
-
-    #[test]
-    fn compact_leaves_a_small_arena_untouched() {
-        let mut arena = NameArena::new();
+        assert_eq!(arena.capacity(), 0, "an unused arena reserves nothing");
         arena.commit(b"abc");
-        arena.compact(COMPACT_THRESHOLD_BYTES);
-        assert_eq!(arena.chunks.len(), 1);
+        assert_eq!(arena.capacity(), ARENA_INITIAL_BYTES);
     }
 
     #[test]
-    fn compact_drops_oldest_chunks_once_over_threshold() {
+    fn arena_grows_at_the_load_factor_and_keeps_its_bytes() {
         let mut arena = NameArena::new();
-        for _ in 0..6 {
-            arena.commit(&vec![0u8; ARENA_CHUNK_BYTES]);
+        // Fill to just under the load factor: 6/8 of 64 bytes is 48.
+        let a = arena.commit(&[b'x'; 48]);
+        assert_eq!(arena.capacity(), ARENA_INITIAL_BYTES);
+        let b = arena.commit(b"yz");
+        assert!(arena.capacity() > ARENA_INITIAL_BYTES, "the run must grow");
+        // SAFETY: both offsets are resolved against the arena's current run,
+        // which is the one the growth just moved the bytes into.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(arena.address(a), 48), vec![b'x'; 48]);
+            assert_eq!(std::slice::from_raw_parts(arena.address(b), 2), b"yz");
         }
-        assert_eq!(arena.chunks.len(), 6);
-        arena.compact(3 * ARENA_CHUNK_BYTES);
-        assert!(arena.chunks.len() < 6, "compact must drop some chunks");
-        assert!(arena.resident <= 3 * ARENA_CHUNK_BYTES);
     }
 
     #[test]
-    fn compact_never_drops_the_last_chunk() {
-        let mut arena = NameArena::new();
-        arena.commit(b"abc");
-        arena.compact(0);
-        assert_eq!(arena.chunks.len(), 1, "the chunk being written to must survive");
+    fn interned_names_survive_a_growth() {
+        let mut s = NameStore::new();
+        let early = s.intern("first-name-interned");
+        assert_eq!(s.get(early.0, early.1), "first-name-interned");
+        // Enough further names to force the run to be relocated.
+        for i in 0..40 {
+            s.intern(&format!("property-number-{i:03}"));
+        }
+        assert!(s.reserved() > ARENA_INITIAL_BYTES, "the run must have grown");
+        // Resolved through the store, an interned name is still readable.
+        let again = s.intern("first-name-interned");
+        assert_eq!(s.get(again.0, again.1), "first-name-interned");
+    }
+
+    #[test]
+    fn deferred_set_holds_only_its_newest_slots() {
+        let mut d = DeferredSet::new();
+        for value in 0..DEFER_SLOTS as i32 + 3 {
+            d.defer(Prop {
+                name_ptr: std::ptr::null(),
+                name_len: 0,
+                kind: ValueKind::Int,
+                value,
+                depth: 0,
+            });
+        }
+        assert_eq!(d.props().count(), DEFER_SLOTS, "capacity must be fixed");
     }
 
     #[test]

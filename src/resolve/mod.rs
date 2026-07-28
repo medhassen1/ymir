@@ -12,7 +12,7 @@ use crate::tile::{Prop, ValueKind};
 ///
 /// SAFETY: `prop.name_ptr` must address `prop.name_len` live bytes for the
 /// call — true for a span read back before enough further names have been
-/// interned to compact away the name arena's chunk holding it.
+/// interned to grow the name arena past the run it was handed out of.
 pub fn render_prop(prop: &Prop) -> u64 {
     let mut acc = kind_seed(prop.kind) ^ (prop.depth as u64).rotate_left(11);
     if !prop.name_ptr.is_null() && prop.name_len != 0 {

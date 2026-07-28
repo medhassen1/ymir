@@ -6,17 +6,16 @@
 //! attenuation pass reads the frontier's origin node through a cursor so the
 //! inner loop does not re-index the arena for every neighbour it considers.
 //!
-//! A region's light doesn't stop at a column's edge: a seed bright enough to
-//! matter is kept as a cross-column bleed source so a later column can still
-//! be measured against it. [`NodeArena`] gives the region a home for every
-//! column's expanded frontier that outlives any single column's own search —
-//! built once per region, it appends each column's nodes into fixed-size
-//! chunks and hands back a pointer into them instead of an owned buffer.
-//! Because the arena lives for the whole pass, its memory is bounded
-//! separately from any one column's lifetime: once the accumulated node count
-//! crosses a threshold, [`NodeArena::compact`] recycles the oldest chunks, the
-//! way a lighting engine reclaims cold pages instead of growing without bound
-//! on a region with many columns.
+//! A region's light doesn't stop at a column's edge: a column's expanded
+//! frontier is kept as a cross-column bleed source so a later column can still
+//! be measured against it. [`NodeArena`] gives the region a home for those
+//! frontiers that outlives any single column's own search — built once per
+//! region, it appends each column's nodes into fixed-size chunks and hands back
+//! a pointer into them instead of an owned buffer. Most columns spread nowhere
+//! near a full chunk's worth of nodes, so a chunk is usually retired with most
+//! of its run unused; [`NodeArena::shrink_to_fit`] right-sizes those retired
+//! chunks down to what they actually hold, the way a lighting engine trims its
+//! scratch instead of carrying a pass's worth of slack to the end of a region.
 
 use crate::budget;
 use crate::chunk::{self, from_linear, linear_index, Column};
@@ -241,106 +240,157 @@ pub fn propagate_column(col: &Column, sources: &[Source], slots: usize) -> Vec<u
 /// typical commit never has to look past the chunk it lands in.
 const ARENA_CHUNK_NODES: usize = 256;
 
-/// Accumulated resident nodes across an arena's live chunks that triggers
-/// [`NodeArena::compact`].
+/// Retired chunks past which [`NodeArena::shrink_to_fit`] stops right-sizing.
 ///
-/// An ordinary region — a modest number of columns, most spreading from a
-/// single torch — never approaches this. A region built from many columns
-/// with wide-reaching sources does, which is exactly the case the bound
-/// exists to catch: without it, a region-lifetime arena would keep every
-/// column's frontier resident for the whole pass no matter how many columns
-/// the region carries.
-const COMPACT_THRESHOLD_NODES: usize = 2048;
+/// Right-sizing copies the chunk it trims. On a short arena that is a couple of
+/// cache lines against a whole page recovered; on a long one the pass would
+/// walk every chunk it has ever retired, once per column, for slack it has
+/// already given back. Past this many chunks the arena keeps what it has.
+const SHRINK_MAX_CHUNKS: usize = 3;
 
-/// A column's frontier at or above this many nodes is wide-reaching enough to
-/// be worth keeping as a cross-column bleed source for the region's closing
-/// pass.
-const RETAIN_MIN_NODES: usize = 96;
+/// Slots in [`BleedWindow`].
+const BLEED_SLOTS: usize = 4;
+
+/// One chunk of a [`NodeArena`]: an exact-sized run of nodes and how far into
+/// it the arena has written.
+struct ArenaChunk {
+    nodes: Box<[LightNode]>,
+    used: usize,
+}
+
+impl ArenaChunk {
+    /// A chunk with room for `cap` nodes and nothing written yet.
+    fn empty(cap: usize) -> ArenaChunk {
+        let filler = LightNode { x: 0, y: 0, z: 0, level: 0, depth: 0 };
+        ArenaChunk { nodes: vec![filler; cap].into_boxed_slice(), used: 0 }
+    }
+
+    /// Nodes this chunk could still take.
+    fn room(&self) -> usize {
+        self.nodes.len() - self.used
+    }
+}
 
 /// A region-lifetime arena for committed column frontiers.
 ///
 /// Built once per region rather than once per column, so a pointer handed out
 /// while searching one column stays valid while later columns are searched —
-/// which is what lets a retained bleed source (see [`propagate_region`]) be
-/// read again well after its own column has finished. Nodes are appended into
-/// fixed-size chunks, each stored as an exact-sized boxed slice; a chunk with
-/// no room left for the next commit is left as-is and a fresh one takes over,
-/// so a single commit is never split across two chunks.
+/// which is what lets a bleed source (see [`propagate_region`]) be read again
+/// well after its own column has finished. Nodes are appended into fixed-size
+/// chunks, each stored as an exact-sized boxed slice; a chunk with no room left
+/// for the next commit is retired as-is and a fresh one takes over, so a single
+/// commit is never split across two chunks.
 struct NodeArena {
-    /// Chunks holding committed column frontiers, oldest first.
-    chunks: Vec<Box<[LightNode]>>,
-    /// Nodes already written into the last chunk.
-    used: usize,
-    /// Nodes held across all currently resident chunks.
-    resident: usize,
+    /// Chunks holding committed column frontiers, oldest first. The last is
+    /// the one currently being written to; the rest are retired.
+    chunks: Vec<ArenaChunk>,
 }
 
 impl NodeArena {
     fn new() -> NodeArena {
-        NodeArena { chunks: Vec::new(), used: 0, resident: 0 }
+        NodeArena { chunks: Vec::new() }
+    }
+
+    /// Nodes held across every chunk the arena has allocated.
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.chunks.iter().map(|c| c.nodes.len()).sum()
     }
 
     /// Commit `nodes` into the arena and return a pointer to where they
     /// landed.
     ///
-    /// If what remains of the current chunk cannot hold `nodes`, a fresh
-    /// chunk takes over first, so the returned pointer's `nodes.len()`
-    /// entries are always contiguous — addressing live memory for as long as
-    /// the chunk backing them stays resident (see [`NodeArena::compact`]).
+    /// If what remains of the open chunk cannot hold `nodes`, a fresh chunk
+    /// takes over first, so the returned pointer's `nodes.len()` entries are
+    /// always contiguous — addressing live memory for as long as the chunk
+    /// backing them stays where it is (see [`NodeArena::shrink_to_fit`]).
     fn commit(&mut self, nodes: &[LightNode]) -> *const LightNode {
         let len = nodes.len();
-        let fits_current = self.chunks.last().is_some_and(|c| self.used + len <= c.len());
-        if !fits_current {
-            let cap = len.max(ARENA_CHUNK_NODES);
-            let filler = LightNode { x: 0, y: 0, z: 0, level: 0, depth: 0 };
-            self.chunks.push(vec![filler; cap].into_boxed_slice());
-            self.used = 0;
-            self.resident += cap;
+        if !self.chunks.last().is_some_and(|c| c.room() >= len) {
+            self.chunks.push(ArenaChunk::empty(len.max(ARENA_CHUNK_NODES)));
         }
         let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
-        chunk[self.used..self.used + len].copy_from_slice(nodes);
-        // SAFETY: `chunk` is a live `Box<[LightNode]>` at least `self.used +
-        // len` entries long — either it already fit `nodes` past `self.used`,
-        // or a chunk sized to hold at least `nodes` was just pushed — so this
-        // offset and the `len` entries from it lie inside the allocation.
-        let ptr = unsafe { chunk.as_ptr().add(self.used) };
-        self.used += len;
+        let at = chunk.used;
+        chunk.nodes[at..at + len].copy_from_slice(nodes);
+        // SAFETY: the `copy_from_slice` above indexed `at .. at + len` of this
+        // chunk, so that range lies inside the allocation and `at` is a valid
+        // offset within it.
+        let ptr = unsafe { chunk.nodes.as_ptr().add(at) };
+        chunk.used = at + len;
         ptr
     }
 
-    /// Drop the oldest resident chunks until the arena's accumulated nodes
-    /// fall back to `threshold`, or only the chunk currently being written to
-    /// is left.
+    /// Right-size the arena's retired chunks to the nodes they actually hold.
     ///
-    /// This is the arena's memory bound: left unchecked, a region-lifetime
-    /// arena would keep every column's frontier resident for the whole pass
-    /// no matter how many columns the region carries. The chunk currently
-    /// being written to is never dropped, since the next commit needs
-    /// somewhere to land.
-    fn compact(&mut self, threshold: usize) {
-        while self.resident > threshold && self.chunks.len() > 1 {
-            let oldest = self.chunks.remove(0);
-            self.resident -= oldest.len();
+    /// A column whose search barely fans out still retires a whole chunk once
+    /// the next column does not fit behind it, so the arena ends up carrying a
+    /// run of chunks that are mostly empty. Reallocating each down to its live
+    /// prefix hands that slack straight back rather than holding it for the
+    /// rest of the pass.
+    ///
+    /// The trim is bounded by `max_chunks`: it copies what it moves, and past
+    /// that many chunks the walk costs more than the slack it recovers. The
+    /// chunk currently being written to is never touched, since the next commit
+    /// continues into it — and a chunk already at its exact size is skipped, so
+    /// a chunk is only ever copied once.
+    fn shrink_to_fit(&mut self, max_chunks: usize) {
+        let retired = self.chunks.len().saturating_sub(1);
+        if retired == 0 || self.chunks.len() > max_chunks {
+            return;
+        }
+        for chunk in &mut self.chunks[..retired] {
+            if chunk.used == chunk.nodes.len() {
+                continue;
+            }
+            // Replacing the box releases the over-sized run this chunk was
+            // allocated with.
+            chunk.nodes = chunk.nodes[..chunk.used].to_vec().into_boxed_slice();
         }
     }
 }
 
-/// A column's frontier retained past its own turn through the region loop,
-/// for the closing cross-column bleed pass to read.
-struct RetainedFrontier {
+/// A column's committed frontier, named for the closing cross-column bleed
+/// pass to read.
+struct BleedSource {
     ptr: *const LightNode,
     len: usize,
+}
+
+/// The frontiers [`propagate_region`]'s closing pass bleeds light from.
+///
+/// Fixed capacity, reused round-robin: every column that lit anything offers
+/// its frontier, and the window keeps the most recent few so the closing pass
+/// costs the same on a region of four columns and one of four thousand.
+struct BleedWindow {
+    slots: [Option<BleedSource>; BLEED_SLOTS],
+    next: usize,
+}
+
+impl BleedWindow {
+    fn new() -> BleedWindow {
+        BleedWindow { slots: [None, None, None, None], next: 0 }
+    }
+
+    /// Put `source` in the next slot, displacing whatever that slot held.
+    fn offer(&mut self, source: BleedSource) {
+        self.slots[self.next] = Some(source);
+        self.next = (self.next + 1) % BLEED_SLOTS;
+    }
+
+    /// The sources currently held, oldest slot first.
+    fn sources(&self) -> impl Iterator<Item = &BleedSource> {
+        self.slots.iter().flatten()
+    }
 }
 
 /// Propagate light across the whole region and fold a digest of the result.
 ///
 /// Each column's levels are folded as they are resolved, then its expanded
 /// frontier is committed into a region-wide [`NodeArena`] rather than freed
-/// with the column: a column whose search reached far enough keeps its
-/// committed frontier registered as a retained bleed source. Once every
-/// column has had its turn, the region's closing pass folds every retained
-/// frontier once more, letting light bleed across a column boundary beyond
-/// the column that produced it.
+/// with the column and offered to the [`BleedWindow`]. Once every column has
+/// had its turn, the region's closing pass folds the window's frontiers once
+/// more, letting light bleed across a column boundary beyond the column that
+/// produced it.
 pub fn propagate_region(region: &Region, n: usize) -> u64 {
     let sources = load_sources(region);
     if sources.is_empty() {
@@ -350,7 +400,7 @@ pub fn propagate_region(region: &Region, n: usize) -> u64 {
     // of many emitters needs a deeper queue than one with a single torch.
     let slots = budget::pool_slots(region, n);
     let mut arena = NodeArena::new();
-    let mut retained: Vec<RetainedFrontier> = Vec::new();
+    let mut window = BleedWindow::new();
     let mut acc = 0xffu64;
     for cid in 0..n {
         let col = match chunk::decode(region, cid) {
@@ -367,26 +417,20 @@ pub fn propagate_region(region: &Region, n: usize) -> u64 {
             continue;
         }
         // Commit this column's expanded frontier into the region's arena.
-        // Only past this point is there a pointer stable enough to retain
-        // past this column's own scope.
+        // Only past this point is there a pointer stable enough to name past
+        // this column's own scope.
         let ptr = arena.commit(&nodes);
+        window.offer(BleedSource { ptr, len: nodes.len() });
 
-        // A column whose search reached far enough keeps its committed
-        // frontier registered as a bleed source for the region's closing
-        // pass to read.
-        if nodes.len() >= RETAIN_MIN_NODES {
-            retained.push(RetainedFrontier { ptr, len: nodes.len() });
-        }
-
-        // Bound the arena's resident memory now that this column's nodes are
-        // safely committed.
-        arena.compact(COMPACT_THRESHOLD_NODES);
+        // Hand back the slack the arena's retired chunks are sitting on, now
+        // that this column's nodes are safely committed.
+        arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
     }
 
-    // Close out the pass by folding in every retained frontier once, letting
-    // light bleed across the column boundary it was captured at.
-    for r in &retained {
-        acc = acc.wrapping_mul(0x100000001b3) ^ diffuse::fold_span(r.ptr, r.len);
+    // Close out the pass by folding in every frontier the window holds,
+    // letting light bleed across the column boundary it was captured at.
+    for s in window.sources() {
+        acc = acc.wrapping_mul(0x100000001b3) ^ diffuse::fold_span(s.ptr, s.len);
     }
     acc
 }
@@ -488,8 +532,9 @@ mod tests {
         let mut arena = NodeArena::new();
         let a = arena.commit(&nodes(4));
         let b = arena.commit(&nodes(2));
-        // SAFETY: neither chunk has been compacted away, so both pointers
-        // still address the nodes just committed.
+        // SAFETY: both landed in the one open chunk, which nothing here has
+        // right-sized, so both pointers still address the nodes just
+        // committed.
         unsafe {
             assert_eq!((*a.add(3)).level, 3);
             assert_eq!((*b.add(1)).level, 1);
@@ -506,22 +551,45 @@ mod tests {
     }
 
     #[test]
-    fn node_arena_compact_drops_oldest_chunks_once_over_threshold() {
+    fn shrink_to_fit_leaves_a_single_open_chunk_alone() {
         let mut arena = NodeArena::new();
-        for _ in 0..6 {
-            arena.commit(&nodes(ARENA_CHUNK_NODES));
-        }
-        assert_eq!(arena.chunks.len(), 6);
-        arena.compact(3 * ARENA_CHUNK_NODES);
-        assert!(arena.chunks.len() < 6, "compact must drop some chunks");
-        assert!(arena.resident <= 3 * ARENA_CHUNK_NODES);
+        arena.commit(&nodes(4));
+        arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
+        assert_eq!(arena.capacity(), ARENA_CHUNK_NODES, "the open chunk must keep its room");
     }
 
     #[test]
-    fn node_arena_compact_never_drops_the_last_chunk() {
+    fn shrink_to_fit_trims_retired_chunks_to_their_live_prefix() {
         let mut arena = NodeArena::new();
-        arena.commit(&nodes(4));
-        arena.compact(0);
-        assert_eq!(arena.chunks.len(), 1, "the chunk being written to must survive");
+        arena.commit(&nodes(200));
+        arena.commit(&nodes(200));
+        assert_eq!(arena.capacity(), 2 * ARENA_CHUNK_NODES);
+        arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
+        assert_eq!(arena.capacity(), 200 + ARENA_CHUNK_NODES);
+        assert_eq!(arena.chunks[0].used, 200, "trimming must keep every live node");
+        // Running again is a no-op: the retired chunk is already exact.
+        arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
+        assert_eq!(arena.capacity(), 200 + ARENA_CHUNK_NODES);
+    }
+
+    #[test]
+    fn shrink_to_fit_stops_once_the_arena_outgrows_the_bound() {
+        let mut arena = NodeArena::new();
+        for _ in 0..SHRINK_MAX_CHUNKS + 1 {
+            arena.commit(&nodes(200));
+        }
+        let held = arena.capacity();
+        arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
+        assert_eq!(arena.capacity(), held, "trimming must respect the bound");
+    }
+
+    #[test]
+    fn bleed_window_holds_only_its_newest_slots() {
+        let mut w = BleedWindow::new();
+        let n = nodes(4);
+        for _ in 0..BLEED_SLOTS + 3 {
+            w.offer(BleedSource { ptr: n.as_ptr(), len: n.len() });
+        }
+        assert_eq!(w.sources().count(), BLEED_SLOTS, "capacity must be fixed");
     }
 }
