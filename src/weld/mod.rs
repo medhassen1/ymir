@@ -1,0 +1,180 @@
+//! Vertex welding and index-buffer generation.
+//!
+//! Greedy meshing emits four independent vertices per quad, but adjacent quads
+//! very often share corners — a merged wall face meets its neighbour on an exact
+//! position/normal/light match. Welding folds those duplicates into one vertex
+//! and rewrites the quads as indices, which is what makes a chunk mesh fit in a
+//! sensible vertex buffer.
+
+use crate::mesh::Vertex;
+
+/// A welded vertex set plus the remap from original corner order to unique ids.
+pub struct WeldTable {
+    /// The deduplicated vertices.
+    pub unique: Vec<Vertex>,
+    /// One entry per original vertex, naming its index in `unique`.
+    pub remap: Vec<u32>,
+}
+
+impl WeldTable {
+    /// How many unique vertices survived welding.
+    pub fn unique_count(&self) -> usize {
+        self.unique.len()
+    }
+
+    /// How many vertices went in.
+    pub fn source_count(&self) -> usize {
+        self.remap.len()
+    }
+
+    /// How many duplicates the weld collapsed.
+    pub fn collapsed(&self) -> usize {
+        self.remap.len().saturating_sub(self.unique.len())
+    }
+
+    /// The fraction of vertices removed, in percent.
+    pub fn ratio_percent(&self) -> u32 {
+        if self.remap.is_empty() {
+            return 0;
+        }
+        (self.collapsed() * 100 / self.remap.len()) as u32
+    }
+}
+
+/// Weld a vertex stream, collapsing exact duplicates.
+///
+/// Two vertices weld only when position, normal and light all agree, so a shared
+/// corner between differently lit faces is correctly kept apart.
+pub fn weld(verts: &[Vertex]) -> WeldTable {
+    let mut unique: Vec<Vertex> = Vec::new();
+    let mut remap: Vec<u32> = Vec::with_capacity(verts.len());
+    for v in verts {
+        match unique.iter().position(|u| u == v) {
+            Some(i) => remap.push(i as u32),
+            None => {
+                unique.push(*v);
+                remap.push((unique.len() - 1) as u32);
+            }
+        }
+    }
+    WeldTable { unique, remap }
+}
+
+/// Build the triangle index buffer for a welded quad stream.
+///
+/// Each quad becomes two triangles — corners `0,1,2` and `0,2,3` — so the buffer
+/// holds six indices per quad. It is filled through a raw cursor because the six
+/// writes per quad are contiguous and the per-index bounds check showed up in
+/// profiles on dense chunk meshes.
+pub fn triangulate(table: &WeldTable) -> Vec<u32> {
+    // Reserve from the welded vertex count: after welding, the quads that
+    // survive are the ones whose corners are still distinct.
+    let quads = table.unique.len() / 4;
+    let mut indices: Vec<u32> = Vec::with_capacity(quads * 6);
+    if quads == 0 {
+        return indices;
+    }
+
+    let cursor = indices.as_mut_ptr();
+    let mut written = 0usize;
+
+    // Walk the original quad stream so every emitted quad keeps its winding.
+    let source_quads = table.remap.len() / 4;
+    // SAFETY: the buffer was reserved for the quads this stream contains, so the
+    // six writes per quad stay inside the reservation.
+    unsafe {
+        for q in 0..source_quads {
+            let a = table.remap[q * 4];
+            let b = table.remap[q * 4 + 1];
+            let c = table.remap[q * 4 + 2];
+            let d = table.remap[q * 4 + 3];
+            *cursor.add(written) = a;
+            *cursor.add(written + 1) = b;
+            *cursor.add(written + 2) = c;
+            *cursor.add(written + 3) = a;
+            *cursor.add(written + 4) = c;
+            *cursor.add(written + 5) = d;
+            written += 6;
+        }
+        indices.set_len(written);
+    }
+    indices
+}
+
+/// Fold a digest of an index buffer.
+pub fn fold_indices(indices: &[u32]) -> u64 {
+    let mut acc = (indices.len() as u64).wrapping_mul(0x9e3779b1);
+    for &i in indices {
+        acc = acc.rotate_left(5) ^ (i as u64);
+    }
+    acc
+}
+
+/// The highest vertex id an index buffer refers to.
+pub fn max_index(indices: &[u32]) -> u32 {
+    indices.iter().copied().max().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vertex(n: u32) -> Vertex {
+        Vertex { pos: n, norm: n * 2, light: n * 3 }
+    }
+
+    /// Four corners per quad, all distinct — nothing welds away.
+    fn distinct_quads(n: usize) -> Vec<Vertex> {
+        (0..n * 4).map(|i| vertex(i as u32)).collect()
+    }
+
+    #[test]
+    fn weld_collapses_exact_duplicates() {
+        let verts = vec![vertex(1), vertex(1), vertex(2)];
+        let t = weld(&verts);
+        assert_eq!(t.unique_count(), 2);
+        assert_eq!(t.source_count(), 3);
+        assert_eq!(t.collapsed(), 1);
+        assert_eq!(t.remap, vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn weld_keeps_distinct_vertices_apart() {
+        let verts = distinct_quads(2);
+        let t = weld(&verts);
+        assert_eq!(t.unique_count(), 8);
+        assert_eq!(t.collapsed(), 0);
+        assert_eq!(t.ratio_percent(), 0);
+    }
+
+    #[test]
+    fn weld_of_nothing_is_empty() {
+        let t = weld(&[]);
+        assert_eq!(t.unique_count(), 0);
+        assert_eq!(t.source_count(), 0);
+        assert_eq!(t.ratio_percent(), 0);
+        assert!(triangulate(&t).is_empty());
+    }
+
+    #[test]
+    fn triangulate_emits_six_indices_per_quad() {
+        let t = weld(&distinct_quads(3));
+        let idx = triangulate(&t);
+        assert_eq!(idx.len(), 18);
+        // First quad: 0,1,2, 0,2,3
+        assert_eq!(&idx[..6], &[0, 1, 2, 0, 2, 3]);
+    }
+
+    #[test]
+    fn triangulate_indices_stay_in_range() {
+        let t = weld(&distinct_quads(4));
+        let idx = triangulate(&t);
+        assert!(max_index(&idx) < t.unique_count() as u32);
+    }
+
+    #[test]
+    fn fold_indices_is_order_sensitive() {
+        assert_ne!(fold_indices(&[0, 1, 2]), fold_indices(&[2, 1, 0]));
+        assert_eq!(max_index(&[]), 0);
+    }
+}
