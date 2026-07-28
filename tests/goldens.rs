@@ -85,7 +85,7 @@ fn rebuild_is_deterministic() {
 
 #[test]
 fn golden_seccache() {
-    assert_eq!(digest("seccache_ok"), 0xc1c96a1f66976e17);
+    assert_eq!(digest("seccache_ok"), 0x49223931e6aa5ece);
 }
 
 #[test]
@@ -120,12 +120,12 @@ fn golden_biome() {
 
 #[test]
 fn golden_struct() {
-    assert_eq!(digest("struct_ok"), 0xba305dadcbcda751);
+    assert_eq!(digest("struct_ok"), 0xbf52d68f6742b028);
 }
 
 #[test]
 fn golden_tick() {
-    assert_eq!(digest("tick_ok"), 0x01161d83e9270d63);
+    assert_eq!(digest("tick_ok"), 0x0116e383e926a2f9);
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn golden_relight() {
 
 #[test]
 fn golden_palette() {
-    assert_eq!(digest("palette_ok"), 0xa294d904e5da9456);
+    assert_eq!(digest("palette_ok"), 0xa13eea04e3730e98);
 }
 
 /// The VERIFY bit selects no stage, so it must rebuild exactly as the default

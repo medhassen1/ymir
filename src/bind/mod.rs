@@ -1,9 +1,10 @@
 //! Component interpretation.
 //!
-//! [`crate::entity`] owns the arena; this module knows how to read a component
-//! out of it. The reader takes the arena cursor and a slot's `(offset, len)`
-//! rather than a borrowed slice, so a region-wide fold walks every component
-//! through one pointer instead of re-borrowing the store per entity.
+//! [`crate::entity`] owns the region-lifetime component arena; this module
+//! knows how to read a component out of it. The reader takes a raw `(pointer,
+//! len)` pair rather than a borrowed slice, so a region-wide fold walks every
+//! retained component through one pointer instead of re-borrowing the arena
+//! per entity.
 
 use crate::entity::Kind;
 
@@ -18,8 +19,7 @@ pub fn read_component(cursor: *const u8, offset: usize, len: usize, kind: Kind) 
     if cursor.is_null() || len == 0 {
         return kind.tag();
     }
-    // SAFETY (claimed): the slot table and the arena cursor come from the same
-    // store, so `offset + len` is inside the arena the cursor names.
+    // SAFETY: guaranteed by the precondition documented above.
     let bytes = unsafe { std::slice::from_raw_parts(cursor.add(offset), len) };
     match kind {
         Kind::Transform | Kind::Velocity => fold_triple(bytes) ^ kind.tag(),

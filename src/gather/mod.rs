@@ -53,6 +53,23 @@ pub fn mean_state(units: &[u32]) -> u32 {
     sum.checked_div(count).unwrap_or(0) as u32
 }
 
+/// Fold a resident column view walked as `units` packed entries.
+///
+/// The caller already knows how many units its column contributed, so the span
+/// is walked from the buffer's start rather than re-deriving its length. That
+/// keeps the fold to one pass over contiguous memory for a whole region.
+///
+/// SAFETY: `cursor` must address at least `units` live entries for the call.
+pub fn fold_span(cursor: *const u32, units: usize, blocks: usize) -> u64 {
+    if cursor.is_null() || units == 0 {
+        return fold_view(&[], blocks);
+    }
+    // SAFETY: `cursor` names the cache's resident buffer for this column and
+    // `units` is the entry count that column packed into it.
+    let span = unsafe { std::slice::from_raw_parts(cursor, units) };
+    fold_view(span, blocks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

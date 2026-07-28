@@ -1,20 +1,36 @@
 //! Relight folding.
 //!
-//! [`crate::relight`] owns the column buffers; this module folds them. The
-//! anneal pass smooths a merged run of columns so that a light discontinuity at
-//! a merge boundary does not show up as a visible seam.
+//! [`crate::relight`] owns the region-lifetime slab ring; this module folds
+//! what it committed. The anneal pass smooths a merged run of columns so that
+//! a light discontinuity at a merge boundary does not show up as a visible
+//! seam.
 
-use crate::relight::ColumnBuf;
-
-/// Fold a merged run of relit columns into a digest.
-pub fn fold_columns(run: &[ColumnBuf]) -> u64 {
-    let mut acc = 0xffu64;
-    for buf in run {
-        let mut h = buf.len() as u64;
-        for &l in buf.levels() {
+/// Fold one column's committed levels into a digest word.
+///
+/// `ptr`/`count` name a column's packed levels, however they are currently
+/// held — resolved fresh from the ring or read back from a retained span.
+///
+/// SAFETY: `ptr` must address at least `count` live levels for the call.
+pub fn fold_one(ptr: *const u8, count: usize) -> u64 {
+    let mut h = count as u64;
+    if !ptr.is_null() && count != 0 {
+        // SAFETY: guaranteed by the precondition documented above.
+        let levels = unsafe { std::slice::from_raw_parts(ptr, count) };
+        for &l in levels {
             h = h.rotate_left(3) ^ (l as u64);
         }
-        acc = acc.wrapping_mul(0x100000001b3) ^ h;
+    }
+    h
+}
+
+/// Fold a run of columns' `(pointer, count)` spans into a digest, in order.
+///
+/// SAFETY: for every `(ptr, count)` pair, `ptr` must address at least `count`
+/// live levels.
+pub fn fold_columns(run: &[(*const u8, usize)]) -> u64 {
+    let mut acc = 0xffu64;
+    for &(ptr, count) in run {
+        acc = acc.wrapping_mul(0x100000001b3) ^ fold_one(ptr, count);
     }
     acc
 }
@@ -53,16 +69,31 @@ mod tests {
 
     #[test]
     fn fold_is_order_sensitive() {
-        let a = ColumnBuf::pack(&[1, 2, 3]);
-        let b = ColumnBuf::pack(&[4, 5, 6]);
-        let fwd = fold_columns(&[a.view(), b.view()]);
-        let rev = fold_columns(&[b.view(), a.view()]);
+        let a = [1u8, 2, 3];
+        let b = [4u8, 5, 6];
+        let fwd = fold_columns(&[(a.as_ptr(), a.len()), (b.as_ptr(), b.len())]);
+        let rev = fold_columns(&[(b.as_ptr(), b.len()), (a.as_ptr(), a.len())]);
         assert_ne!(fwd, rev);
     }
 
     #[test]
     fn fold_of_empty_run_is_the_seed() {
         assert_eq!(fold_columns(&[]), 0xff);
+    }
+
+    #[test]
+    fn fold_walks_only_the_paired_count() {
+        // A count shorter than the buffer's own length only folds the prefix.
+        let a = [1u8, 2, 3, 4, 5];
+        let short = fold_columns(&[(a.as_ptr(), 2)]);
+        let full = fold_columns(&[(a.as_ptr(), a.len())]);
+        assert_ne!(short, full);
+    }
+
+    #[test]
+    fn fold_one_treats_null_as_the_count_only() {
+        assert_eq!(fold_one(std::ptr::null(), 0), 0);
+        assert_eq!(fold_one(std::ptr::null(), 4), 4);
     }
 
     #[test]

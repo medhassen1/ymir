@@ -1,7 +1,7 @@
 //! Tick firing.
 //!
 //! [`crate::tick`] owns the queue; this module fires it. Each entry is ranked
-//! against the queue's anchor entry, which arrives by pointer so the ranking
+//! against its round's anchor entry, which arrives by pointer so the ranking
 //! loop does not re-index the queue per comparison.
 
 use crate::tick::TickEntry;
@@ -17,8 +17,8 @@ pub fn fire(entries: &[TickEntry], anchor: *const TickEntry, slack: usize) -> u6
     if anchor.is_null() {
         return 0;
     }
-    // SAFETY (claimed): the queue's storage outlives this call, so the anchor
-    // still names its reference entry.
+    // SAFETY: per this function's contract, the caller guarantees `anchor`
+    // points at a live queue entry for the duration of the call.
     let base = unsafe { *anchor };
 
     let mut acc = (base.at_tick as u64).wrapping_mul(0x9e3779b1) ^ (base.priority as u64);
@@ -38,6 +38,34 @@ fn rank_against(e: &TickEntry, base: &TickEntry) -> u64 {
     let dt = (e.at_tick as i64 - base.at_tick as i64).unsigned_abs();
     let dp = (e.priority as i64 - base.priority as i64).unsigned_abs();
     dt.wrapping_mul(31).wrapping_add(dp).wrapping_add(e.sub_order as u64)
+}
+
+/// Fold a digest of a retained round's fired entries, read from the region's
+/// entry pool.
+///
+/// [`crate::tick::drain_region`] drains the due queue in rounds, committing
+/// each round's entries into a region-lifetime pool, and a busy round is kept
+/// as a retained cross-round anchor so the region's closing pass can rank it
+/// again once every round has fired. This is that pass's read: `ptr`/`len`
+/// name the committed span directly, walked through raw pointer arithmetic
+/// rather than a bounds-checked index.
+///
+/// SAFETY: `ptr` must address at least `len` live [`TickEntry`] values for the
+/// call.
+pub fn fold_anchor(ptr: *const TickEntry, len: usize) -> u64 {
+    if ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let mut acc = 0x2545f491u64;
+    // SAFETY: per this function's contract, the caller guarantees `ptr`
+    // addresses at least `len` live entries.
+    unsafe {
+        for i in 0..len {
+            let e = *ptr.add(i);
+            acc = acc.rotate_left(9) ^ (e.at_tick as u64) ^ ((e.target as u64) << 8) ^ (e.priority as u64);
+        }
+    }
+    acc
 }
 
 /// The span of due times across a set of entries, as `(earliest, latest)`.
@@ -119,5 +147,25 @@ mod tests {
         let e = [entry(0, 1, 0), entry(0, 1, 1), entry(0, 4, 2)];
         assert_eq!(priority_variety(&e), 2);
         assert_eq!(priority_variety(&[]), 0);
+    }
+
+    #[test]
+    fn fold_anchor_is_deterministic() {
+        let e = [entry(1, 0, 0), entry(2, 0, 1)];
+        assert_eq!(fold_anchor(e.as_ptr(), e.len()), fold_anchor(e.as_ptr(), e.len()));
+    }
+
+    #[test]
+    fn fold_anchor_reflects_contents() {
+        let a = [entry(1, 0, 0), entry(2, 0, 1)];
+        let b = [entry(1, 0, 0), entry(9, 0, 1)];
+        assert_ne!(fold_anchor(a.as_ptr(), a.len()), fold_anchor(b.as_ptr(), b.len()));
+    }
+
+    #[test]
+    fn fold_anchor_of_null_or_empty_is_zero() {
+        let e = [entry(1, 0, 0)];
+        assert_eq!(fold_anchor(std::ptr::null(), 4), 0);
+        assert_eq!(fold_anchor(e.as_ptr(), 0), 0);
     }
 }

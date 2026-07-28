@@ -4,6 +4,13 @@
 //! a whole row through the view the grid handed out, so the nine taps of a 3x3
 //! kernel cost three pointer walks rather than nine bounds-checked index
 //! operations.
+//!
+//! [`mix_row`] has two call sites in [`crate::biome::resolve_region`]: once per
+//! row as each column is decoded, and once more at the end of the region's
+//! pass for every row a column retained as a cross-column reference. Both
+//! calls share the same contract — the caller names a live `(pointer, length)`
+//! pair — since this module has no way to tell which kind of call it is
+//! looking at.
 
 /// Weights of the horizontal three-tap kernel, in sixteenths.
 const KERNEL: [u32; 3] = [4, 8, 4];
@@ -19,8 +26,8 @@ pub fn mix_row(view: *const u8, edge: usize, z: u8) -> u64 {
         return 0;
     }
     let mut acc = (z as u64).rotate_left(23) ^ 0x2545f491;
-    // SAFETY (claimed): the grid allocated this row in full before handing out
-    // the view, so `view.add(i)` for `i < edge` stays inside the allocation.
+    // SAFETY: per this function's contract, the caller guarantees `view`
+    // addresses at least `edge` live cells.
     unsafe {
         for x in 0..edge {
             let left = *view.add(x.saturating_sub(1));

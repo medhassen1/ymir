@@ -67,11 +67,12 @@ pub fn weld(verts: &[Vertex]) -> WeldTable {
 /// writes per quad are contiguous and the per-index bounds check showed up in
 /// profiles on dense chunk meshes.
 pub fn triangulate(table: &WeldTable) -> Vec<u32> {
-    // Reserve from the welded vertex count: after welding, the quads that
-    // survive are the ones whose corners are still distinct.
-    let quads = table.unique.len() / 4;
-    let mut indices: Vec<u32> = Vec::with_capacity(quads * 6);
-    if quads == 0 {
+    // Reserve from the source quad count. Welding collapses duplicate corners,
+    // so the unique vertex count is a lower bound on the quads written and
+    // reserving from it would under-size the buffer.
+    let source_quads = table.remap.len() / 4;
+    let mut indices: Vec<u32> = Vec::with_capacity(source_quads * 6);
+    if source_quads == 0 {
         return indices;
     }
 
@@ -79,7 +80,6 @@ pub fn triangulate(table: &WeldTable) -> Vec<u32> {
     let mut written = 0usize;
 
     // Walk the original quad stream so every emitted quad keeps its winding.
-    let source_quads = table.remap.len() / 4;
     // SAFETY: the buffer was reserved for the quads this stream contains, so the
     // six writes per quad stay inside the reservation.
     unsafe {
@@ -99,6 +99,35 @@ pub fn triangulate(table: &WeldTable) -> Vec<u32> {
         indices.set_len(written);
     }
     indices
+}
+
+/// Fold a digest of a column mesh retained in the region's [`crate::mesh`]
+/// vertex arena.
+///
+/// [`crate::mesh::build_region`] commits every column's finished mesh into a
+/// region-lifetime arena, and a column whose mesh is large enough is kept as a
+/// retained boundary reference so the region's closing seam pass can fold it
+/// again once every column has had its own turn through the loop. This is
+/// that pass's read: `ptr`/`len` name the committed span directly, walked
+/// through raw pointer arithmetic rather than a bounds-checked index, so nothing
+/// here depends on `Vec`'s own capacity bookkeeping.
+///
+/// SAFETY: `ptr` must address at least `len` live [`Vertex`] values for the
+/// call.
+pub fn fold_span(ptr: *const Vertex, len: usize, seed: u64) -> u64 {
+    if ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let mut acc = seed ^ 0x2545f491;
+    // SAFETY: per this function's contract, the caller guarantees `ptr`
+    // addresses at least `len` live vertices.
+    unsafe {
+        for i in 0..len {
+            let v = *ptr.add(i);
+            acc = acc.rotate_left(5) ^ (v.pos as u64) ^ ((v.norm as u64) << 3) ^ (v.light as u64);
+        }
+    }
+    acc
 }
 
 /// Fold a digest of an index buffer.
@@ -176,5 +205,32 @@ mod tests {
     fn fold_indices_is_order_sensitive() {
         assert_ne!(fold_indices(&[0, 1, 2]), fold_indices(&[2, 1, 0]));
         assert_eq!(max_index(&[]), 0);
+    }
+
+    #[test]
+    fn fold_span_is_deterministic() {
+        let verts = distinct_quads(2);
+        assert_eq!(
+            fold_span(verts.as_ptr(), verts.len(), 7),
+            fold_span(verts.as_ptr(), verts.len(), 7)
+        );
+    }
+
+    #[test]
+    fn fold_span_reflects_seed_and_contents() {
+        let verts = distinct_quads(2);
+        assert_ne!(fold_span(verts.as_ptr(), verts.len(), 7), fold_span(verts.as_ptr(), verts.len(), 8));
+        let other = distinct_quads(3);
+        assert_ne!(
+            fold_span(verts.as_ptr(), verts.len(), 7),
+            fold_span(other.as_ptr(), other.len(), 7)
+        );
+    }
+
+    #[test]
+    fn fold_span_of_null_or_empty_is_zero() {
+        let verts = distinct_quads(1);
+        assert_eq!(fold_span(std::ptr::null(), 4, 7), 0);
+        assert_eq!(fold_span(verts.as_ptr(), 0, 7), 0);
     }
 }

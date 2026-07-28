@@ -5,6 +5,20 @@
 //! is rebuilt whenever a region's blocks change. Columns are stored in one flat
 //! array and the profiler reads them through a cursor, because the smoothing
 //! pass touches each column several times and re-indexing dominated the profile.
+//!
+//! A region's height pass rebuilds one column's map at a time, but a slope
+//! reading is more useful with a neighbour to compare against, so a handful of
+//! columns spaced across the region keep their map's span registered in a
+//! retained list for the rest of the pass — see [`RETAIN_STRIDE`] in
+//! [`rebuild_region`]. That only works if a column's map outlives the column
+//! itself, which is what [`HeightArena`] is for: built once per region rather
+//! than once per column, it appends every column's finished map into
+//! fixed-size chunks and hands back a pointer into them instead of an owned
+//! buffer. Because the arena lives for the whole pass, its memory is bounded
+//! separately from any one column's lifetime: once the accumulated volume
+//! crosses a threshold, [`HeightArena::compact`] drops the oldest chunks, the
+//! way a buffer pool reclaims cold pages instead of growing without bound on a
+//! region with many columns.
 
 use crate::chunk::{self, linear_index, Column};
 use crate::common::*;
@@ -33,6 +47,15 @@ impl HeightMap {
     /// The number of columns held.
     pub fn len(&self) -> usize {
         self.columns.len()
+    }
+
+    /// How many rows of columns the map currently holds.
+    ///
+    /// A flat map holds exactly `MAP_EDGE` rows; a column whose stack recorded
+    /// overflow rows holds more, so the profiler walks however many rows the
+    /// map actually grew to.
+    pub fn rows(&self) -> usize {
+        self.columns.len() / MAP_EDGE
     }
 
     /// Whether the map holds no columns.
@@ -85,6 +108,104 @@ impl HeightMap {
     }
 }
 
+/// Columns held by one [`HeightArena`] chunk.
+///
+/// An ordinary column's map — the flat map plus up to [`MAX_STACK`] overflow
+/// rows — fits with room to spare, so an ordinary commit never has to look
+/// past the chunk it lands in.
+const ARENA_CHUNK_UNITS: usize = 4 * MAP_AREA;
+
+/// Accumulated resident columns across an arena's live chunks that triggers
+/// [`HeightArena::compact`].
+///
+/// An ordinary region's height pass — a modest number of columns, most flat —
+/// never approaches this. A region built from many tall, heavily overflowing
+/// columns does, which is exactly the case the bound exists to catch: without
+/// it, a region-lifetime arena would keep every column's map resident for the
+/// whole pass no matter how many columns the region carries.
+const COMPACT_THRESHOLD_UNITS: usize = 16 * MAP_AREA;
+
+/// Spacing between columns that register a retained map span.
+///
+/// The first column has no earlier neighbour to compare against, so retention
+/// starts at the first multiple of the stride past it.
+const RETAIN_STRIDE: usize = 8;
+
+/// A region-lifetime arena for finished column heightmaps.
+///
+/// Built once per region rather than once per column, so a span handed out
+/// while rebuilding one column's map stays valid while later columns are
+/// rebuilt — which is what lets a retained map span (see [`rebuild_region`])
+/// be read again well after its own column has finished. Columns are appended
+/// into fixed-size chunks, each stored as an exact-sized boxed slice; a chunk
+/// with no room left for the next commit is left as-is and a fresh one takes
+/// over, so a single column's map is never split across two chunks.
+struct HeightArena {
+    /// Chunks holding committed column data, oldest first.
+    chunks: Vec<Box<[u16]>>,
+    /// Columns already written into the last chunk.
+    used: usize,
+    /// Columns held across all currently resident chunks.
+    resident: usize,
+}
+
+impl HeightArena {
+    fn new() -> HeightArena {
+        HeightArena { chunks: Vec::new(), used: 0, resident: 0 }
+    }
+
+    /// Commit a column's map into the arena and return a pointer to where it
+    /// landed.
+    ///
+    /// If what remains of the current chunk cannot hold `cols`, a fresh chunk
+    /// takes over first, so the returned pointer's `cols.len()` entries are
+    /// always contiguous — addressing live memory for as long as the chunk
+    /// backing them stays resident (see [`HeightArena::compact`]).
+    fn commit(&mut self, cols: &[u16]) -> *const u16 {
+        let len = cols.len();
+        let fits_current = self.chunks.last().is_some_and(|c| self.used + len <= c.len());
+        if !fits_current {
+            let cap = len.max(ARENA_CHUNK_UNITS);
+            self.chunks.push(vec![0u16; cap].into_boxed_slice());
+            self.used = 0;
+            self.resident += cap;
+        }
+        let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
+        chunk[self.used..self.used + len].copy_from_slice(cols);
+        // SAFETY: `chunk` is a live `Box<[u16]>` at least `self.used + len`
+        // entries long — either it already fit `cols` past `self.used`, or a
+        // chunk sized to hold at least `cols` was just pushed — so this
+        // offset and the `len` entries from it lie inside the allocation.
+        let ptr = unsafe { chunk.as_ptr().add(self.used) };
+        self.used += len;
+        ptr
+    }
+
+    /// Drop the oldest resident chunks until the arena's accumulated columns
+    /// fall back to `threshold`, or only the chunk currently being written to
+    /// is left.
+    ///
+    /// This is the arena's memory bound: left unchecked, a region-lifetime
+    /// arena would keep every column's map resident for the whole pass no
+    /// matter how many columns the region carries. The chunk currently being
+    /// written to is never dropped, since the next commit needs somewhere to
+    /// land.
+    fn compact(&mut self, threshold: usize) {
+        while self.resident > threshold && self.chunks.len() > 1 {
+            let oldest = self.chunks.remove(0);
+            self.resident -= oldest.len();
+        }
+    }
+}
+
+/// A column's map span retained past its own turn through [`rebuild_region`]'s
+/// main loop, for the closing profile pass to read once the whole region has
+/// been walked.
+struct RetainedSpan {
+    ptr: *const u16,
+    rows: usize,
+}
+
 /// Scan one column's sections and record the highest solid block per position.
 pub fn scan_column(col: &Column) -> HeightMap {
     let mut map = HeightMap::flat(col.base_y);
@@ -121,11 +242,28 @@ pub fn overflow_rows(col: &Column, world_height: usize) -> usize {
     over.min(world_height / SECTION_EDGE).min(MAX_STACK)
 }
 
+/// Whether any section of `col` could actually raise a column's recorded
+/// height.
+///
+/// A stack whose every section is empty cannot change what [`scan_column`]
+/// records anywhere: every reading stays at the flat map's base value. Growing
+/// the map's storage for such a column's predicted overflow would only add
+/// rows holding the same zero the flat map already starts with.
+fn overflow_is_solid(col: &Column) -> bool {
+    col.sections.iter().any(|s| !s.is_empty())
+}
+
 /// Rebuild the heightmap for every column and fold a digest of the result.
 ///
-/// The profile cursor is taken once per column, before the map is extended for
-/// the column's overflow rows, so the smoothing pass reads every neighbour
-/// through one pointer.
+/// Each column's finished map is committed into a region-wide [`HeightArena`]
+/// rather than freed with the column: a spaced-out subset of columns keep
+/// their map's span registered in a retained list for the rest of the pass,
+/// giving a later column a cross-region neighbour to measure slope against
+/// beyond just its immediate predecessor. The row count handed to the
+/// profiler is always the map's actual row count — never a predicted span the
+/// map's storage may not have actually grown to — so the profiler never reads
+/// past what a column really committed. The retained spans are profiled once
+/// more at the end, closing out the pass.
 pub fn rebuild_region(region: &Region, n: usize) -> u64 {
     // The `hgts` section supplies a per-region bias applied to every column.
     let bias = {
@@ -133,7 +271,10 @@ pub fn rebuild_region(region: &Region, n: usize) -> u64 {
         c.i16() as i32
     };
 
+    let mut arena = HeightArena::new();
+    let mut retained: Vec<RetainedSpan> = Vec::new();
     let mut acc = 0xffu64 ^ (bias as i64 as u64);
+
     for cid in 0..n {
         let col = match chunk::decode(region, cid) {
             Ok(c) => c,
@@ -144,18 +285,40 @@ pub fn rebuild_region(region: &Region, n: usize) -> u64 {
         }
         let mut map = scan_column(&col);
 
-        // The profile reads neighbouring columns through this cursor.
-        let cursor = map.cursor();
-
         // Tall columns record their overflow in extra rows before profiling.
+        // Growing the map costs a reallocation, which is skipped when the
+        // overflow cannot hold a solid block in the first place.
         let extra = overflow_rows(&col, region.world_height);
-        if extra > 0 {
+        if extra > 0 && overflow_is_solid(&col) {
             map.extend_span(extra);
         }
 
-        acc = acc.wrapping_mul(0x100000001b3)
-            ^ profile::slope_sum(cursor, MAP_EDGE, bias);
+        // Commit this column's finished map into the region's arena. Only
+        // past this point is there a pointer stable enough to retain past
+        // this column's own scope. The row count committed is the map's own
+        // — whatever it actually grew to, never a larger predicted span.
+        let rows = map.rows();
+        let ptr = arena.commit(map.columns());
+        acc = acc.wrapping_mul(0x100000001b3) ^ profile::slope_sum(ptr, rows, MAP_EDGE, bias);
+
+        // Every `RETAIN_STRIDE`-th column past the first keeps its map span
+        // alive as a neighbour for later columns to measure slope against,
+        // giving the region continuity beyond just each column's immediate
+        // predecessor.
+        if cid > 0 && cid % RETAIN_STRIDE == 0 {
+            retained.push(RetainedSpan { ptr, rows });
+        }
+
+        // Bound the arena's resident memory now that this column's map is
+        // safely committed.
+        arena.compact(COMPACT_THRESHOLD_UNITS);
     }
+
+    // Close out the pass by profiling every retained span once.
+    for r in &retained {
+        acc = acc.wrapping_mul(0x100000001b3) ^ profile::slope_sum(r.ptr, r.rows, MAP_EDGE, bias);
+    }
+
     acc
 }
 
@@ -182,6 +345,14 @@ mod tests {
         assert_eq!(m.len(), MAP_AREA);
         assert_eq!(m.peak(), 0);
         assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn rows_reflects_the_flat_and_extended_span() {
+        let mut m = HeightMap::flat(0);
+        assert_eq!(m.rows(), MAP_EDGE);
+        m.extend_span(2);
+        assert_eq!(m.rows(), MAP_EDGE + 2);
     }
 
     #[test]
@@ -224,6 +395,28 @@ mod tests {
         assert_eq!(overflow_rows(&column_with(9, true), 32), 2);
     }
 
+    fn empty_flagged_column(sections: usize) -> Column {
+        let secs = (0..sections)
+            .map(|i| SectionData {
+                palette: vec![0],
+                blocks: Vec::new(),
+                flags: crate::format::sec::EMPTY,
+                base_y: (i * 16) as i32,
+            })
+            .collect();
+        Column { sections: secs, base_y: 0, flags: 0, cid: 0 }
+    }
+
+    #[test]
+    fn overflow_is_solid_ignores_an_all_empty_stack() {
+        assert!(!overflow_is_solid(&empty_flagged_column(3)));
+        assert!(overflow_is_solid(&column_with(3, true)));
+        // A single solid section among empty ones is still enough.
+        let mut mixed = empty_flagged_column(2);
+        mixed.sections.push(column_with(1, true).sections.remove(0));
+        assert!(overflow_is_solid(&mixed));
+    }
+
     #[test]
     fn extend_span_only_grows() {
         let mut m = HeightMap::flat(0);
@@ -231,5 +424,130 @@ mod tests {
         assert_eq!(m.len(), MAP_AREA + 2 * MAP_EDGE);
         m.extend_span(1);
         assert_eq!(m.len(), MAP_AREA + 2 * MAP_EDGE, "extend must not shrink");
+    }
+
+    #[test]
+    fn arena_commit_writes_are_readable_back() {
+        let mut arena = HeightArena::new();
+        let a = arena.commit(&[1, 2, 3, 4]);
+        let b = arena.commit(&[5, 6]);
+        // SAFETY: neither chunk has been compacted away, so both pointers
+        // still address the entries just committed.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(a, 4), [1, 2, 3, 4]);
+            assert_eq!(std::slice::from_raw_parts(b, 2), [5, 6]);
+        }
+    }
+
+    #[test]
+    fn arena_starts_a_new_chunk_once_the_current_one_is_full() {
+        let mut arena = HeightArena::new();
+        let filler = vec![0u16; ARENA_CHUNK_UNITS - 4];
+        arena.commit(&filler);
+        assert_eq!(arena.chunks.len(), 1);
+        arena.commit(&[1, 2, 3, 4, 5]);
+        assert_eq!(arena.chunks.len(), 2);
+    }
+
+    #[test]
+    fn compact_leaves_a_small_arena_untouched() {
+        let mut arena = HeightArena::new();
+        arena.commit(&[1, 2, 3]);
+        arena.compact(COMPACT_THRESHOLD_UNITS);
+        assert_eq!(arena.chunks.len(), 1);
+    }
+
+    #[test]
+    fn compact_drops_oldest_chunks_once_over_threshold() {
+        let mut arena = HeightArena::new();
+        for _ in 0..6 {
+            arena.commit(&vec![0u16; ARENA_CHUNK_UNITS]);
+        }
+        assert_eq!(arena.chunks.len(), 6);
+        arena.compact(3 * ARENA_CHUNK_UNITS);
+        assert!(arena.chunks.len() < 6, "compact must drop some chunks");
+        assert!(arena.resident <= 3 * ARENA_CHUNK_UNITS);
+    }
+
+    #[test]
+    fn compact_never_drops_the_last_chunk() {
+        let mut arena = HeightArena::new();
+        arena.commit(&[1, 2, 3]);
+        arena.compact(0);
+        assert_eq!(arena.chunks.len(), 1, "the chunk being written to must survive");
+    }
+
+    /// Build a minimal region with a flat, single-section column repeated
+    /// `num_chunks` times, for exercising [`rebuild_region`] over more than
+    /// one column.
+    fn region_with_flat_columns(num_chunks: u16) -> Vec<u8> {
+        use crate::format::*;
+
+        fn column_record() -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&1u16.to_be_bytes()); // one section
+            out.extend_from_slice(&0i16.to_be_bytes());
+            out.push(0);
+            out.push(0);
+            out.push(crate::format::sec::UNIFORM);
+            out.extend_from_slice(&2u16.to_be_bytes());
+            out.extend_from_slice(&0u16.to_be_bytes());
+            out.extend_from_slice(&5u16.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes()); // uniform index
+            out
+        }
+
+        let cols: Vec<Vec<u8>> = (0..num_chunks).map(|_| column_record()).collect();
+        let cdat: Vec<u8> = cols.iter().flatten().copied().collect();
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&MAGIC);
+        v.extend_from_slice(&VERSION.to_be_bytes());
+        v.extend_from_slice(&flag::HEIGHT.to_be_bytes());
+        v.extend_from_slice(&0i16.to_be_bytes());
+        v.extend_from_slice(&0i16.to_be_bytes());
+        v.extend_from_slice(&num_chunks.to_be_bytes());
+        v.extend_from_slice(&3u16.to_be_bytes());
+        v.extend_from_slice(&0x5EEDu32.to_be_bytes());
+        v.extend_from_slice(&64u16.to_be_bytes());
+        v.push(4);
+        v.push(3);
+        v.extend_from_slice(&0u16.to_be_bytes());
+        assert_eq!(v.len(), HEADER_LEN);
+
+        let dir_end = HEADER_LEN + 3 * DIR_ENTRY;
+        let cmap_off = dir_end;
+        let cmap_len = (num_chunks as usize + 1) * 4;
+        let cdat_off = cmap_off + cmap_len;
+        let hgts_off = cdat_off + cdat.len();
+        let hgts = 3i16.to_be_bytes();
+
+        v.extend_from_slice(&tag::CMAP);
+        v.extend_from_slice(&(cmap_off as u32).to_be_bytes());
+        v.extend_from_slice(&(cmap_len as u32).to_be_bytes());
+        v.extend_from_slice(&tag::CDAT);
+        v.extend_from_slice(&(cdat_off as u32).to_be_bytes());
+        v.extend_from_slice(&(cdat.len() as u32).to_be_bytes());
+        v.extend_from_slice(&tag::HGTS);
+        v.extend_from_slice(&(hgts_off as u32).to_be_bytes());
+        v.extend_from_slice(&(hgts.len() as u32).to_be_bytes());
+
+        let mut at = 0u32;
+        for c in &cols {
+            v.extend_from_slice(&at.to_be_bytes());
+            at += c.len() as u32;
+        }
+        v.extend_from_slice(&at.to_be_bytes());
+        v.extend_from_slice(&cdat);
+        v.extend_from_slice(&hgts);
+        v
+    }
+
+    #[test]
+    fn rebuild_region_is_deterministic_across_columns() {
+        let data = region_with_flat_columns(9);
+        let region = crate::parse::parse(&data).expect("valid region");
+        let n = region.worked_chunks();
+        assert_eq!(rebuild_region(&region, n), rebuild_region(&region, n));
     }
 }
