@@ -1,0 +1,16 @@
+language: rust
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer
+main_repo: "https://github.com/medhassen1/ymir"
+fuzz_targets:
+  # Full rebuild: the header's flag bits steer this into any of the eleven
+  # rebuild stages, so one target reaches every subsystem.
+  - a_rebuild_fuzzer
+  # Structural validation only: parse, decode every column, walk the structure
+  # template recursion. Stops before derived data is rebuilt.
+  - b_verify_fuzzer
+  # Column-level passes driven directly, bypassing the header's stage
+  # selection: flatten, heightmap scan, palette repack, relight, mesh + weld.
+  - c_column_fuzzer
