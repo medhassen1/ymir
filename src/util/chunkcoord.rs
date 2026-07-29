@@ -1,8 +1,9 @@
 //! World <-> chunk <-> section <-> region coordinate conversions.
 //!
 //! Every store access must land on the right chunk, section, linear index,
-//! and region file; getting negative coordinates wrong is the most common
-//! bug here, so every conversion is built on `div_euclid`/`rem_euclid`.
+//! and region file. Negative coordinates are what makes that delicate — `/`
+//! and `%` truncate toward zero — so every conversion here is built on
+//! `div_euclid`/`rem_euclid` instead.
 
 /// Blocks per chunk-section edge.
 pub const SECTION_EDGE: usize = 16;

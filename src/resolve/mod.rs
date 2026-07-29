@@ -35,6 +35,27 @@ fn kind_seed(kind: ValueKind) -> u64 {
     }
 }
 
+/// Fold a compound closed, once everything nested inside it has been decoded.
+///
+/// A compound's digest is the name it was opened under together with how much
+/// it turned out to contain, which is only known on the way back out of the
+/// subtree. `contained` is the digest the nested decode accumulated. The name is
+/// read through the compound's own span, the same way [`render_prop`] reads it.
+///
+/// SAFETY: `prop.name_ptr` must address `prop.name_len` live bytes for the
+/// call.
+pub fn close_compound(prop: &Prop, contained: u64) -> u64 {
+    let mut acc = contained.rotate_left(17) ^ kind_seed(prop.kind);
+    if !prop.name_ptr.is_null() && prop.name_len != 0 {
+        // SAFETY: guaranteed by the precondition documented above.
+        let name = unsafe { std::slice::from_raw_parts(prop.name_ptr, prop.name_len) };
+        for &b in name {
+            acc = acc.rotate_left(3) ^ ((b as u64) << 7);
+        }
+    }
+    acc ^ (prop.depth as u64).rotate_left(29)
+}
+
 /// Fold a whole tree's properties in order.
 pub fn render_all(props: &[Prop]) -> u64 {
     let mut acc = 0xffu64;
@@ -93,6 +114,25 @@ mod tests {
         let a = render_prop(&p);
         let empty = prop(std::ptr::null(), 0, ValueKind::Int, 9, 0);
         assert_eq!(a, render_prop(&empty));
+    }
+
+    #[test]
+    fn close_compound_covers_the_name_and_what_it_held() {
+        let mut s = NameStore::new();
+        let (ptr, len) = s.intern("Items");
+        let p = prop(ptr, len, ValueKind::Compound, 0, 1);
+        let base = close_compound(&p, 7);
+        assert_ne!(base, close_compound(&p, 8), "contents must move the digest");
+        let mut t = NameStore::new();
+        let (other, other_len) = t.intern("Other");
+        let q = prop(other, other_len, ValueKind::Compound, 0, 1);
+        assert_ne!(base, close_compound(&q, 7), "the name must move it too");
+        // An unnamed compound folds its contents and depth only.
+        let anon = prop(std::ptr::null(), 4, ValueKind::Compound, 0, 1);
+        assert_eq!(
+            close_compound(&anon, 7),
+            close_compound(&prop(std::ptr::null(), 0, ValueKind::Compound, 0, 1), 7)
+        );
     }
 
     #[test]

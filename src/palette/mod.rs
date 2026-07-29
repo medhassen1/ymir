@@ -152,6 +152,13 @@ pub fn used_indices(blocks: &[u16], palette_len: usize) -> Vec<bool> {
 /// distinct palettes does, which is exactly what the growth path exists for.
 const POOL_INIT_UNITS: usize = 256;
 
+/// Entries past which the pool stops growing and starts recycling instead.
+///
+/// A region of ordinary size never reaches this: its whole palette set fits and
+/// the pool simply grows to hold it. A region built from thousands of sections
+/// does, which is what the recycling path exists for.
+const POOL_CEILING_UNITS: usize = 4096;
+
 /// Shared palette spans the ring keeps addressable at once.
 ///
 /// Four is enough to give the closing fold a cross-region term reaching back
@@ -172,16 +179,30 @@ const SHARED_SLOTS: usize = 4;
 /// the entries moved into it, the old one released. Growth at least doubles,
 /// so a region with many sections grows a logarithmic number of times rather
 /// than once per section.
+///
+/// Growth alone would make a region-lifetime pool hold every palette the region
+/// ever repacked. [`EntryPool::recycle`] is the bound: past a ceiling the oldest
+/// sections' entries are dropped and the rest slid down, so what the pool holds
+/// tracks the sections still being referred to rather than the section count.
 struct EntryPool {
     /// The committed entries, back to back from index zero.
     entries: Box<[u16]>,
     /// How much of `entries` the committed spans occupy.
     used: usize,
+    /// Where each committed section's entries start, oldest first.
+    starts: Vec<usize>,
+    /// How many times the pool has taken a different buffer.
+    grows: usize,
 }
 
 impl EntryPool {
     fn new() -> EntryPool {
-        EntryPool { entries: vec![0u16; POOL_INIT_UNITS].into_boxed_slice(), used: 0 }
+        EntryPool {
+            entries: vec![0u16; POOL_INIT_UNITS].into_boxed_slice(),
+            used: 0,
+            starts: Vec::new(),
+            grows: 0,
+        }
     }
 
     /// Commit `entries` into the pool and return a pointer to where they
@@ -192,9 +213,10 @@ impl EntryPool {
     /// pool's own.
     fn commit(&mut self, entries: &[u16]) -> *const u16 {
         if self.used + entries.len() > self.entries.len() {
-            self.grow(entries.len());
+            self.recycle(entries.len());
         }
         let start = self.used;
+        self.starts.push(start);
         self.entries[start..start + entries.len()].copy_from_slice(entries);
         self.used += entries.len();
         // SAFETY: the copy above wrote `entries.len()` values starting at
@@ -202,20 +224,72 @@ impl EntryPool {
         unsafe { self.entries.as_ptr().add(start) }
     }
 
-    /// Take a larger buffer, at least big enough for a commit of `need`
-    /// entries, and move what the pool holds into it.
-    fn grow(&mut self, need: usize) {
-        let want = (self.used + need).max(self.entries.len() * 2);
-        let mut grown = vec![0u16; want].into_boxed_slice();
-        grown[..self.used].copy_from_slice(&self.entries[..self.used]);
-        self.entries = grown;
+    /// The address `at` names in the pool's current buffer.
+    fn address(&self, at: usize) -> *const u16 {
+        // SAFETY: the pool's buffer is live for as long as the pool is.
+        unsafe { self.entries.as_ptr().add(at) }
+    }
+
+    /// Make room for a commit of `need` entries.
+    ///
+    /// While the pool is under its ceiling this simply takes a larger buffer.
+    /// Past it, the oldest sections are dropped first and the survivors slid
+    /// down to the front, so a region with thousands of sections settles at a
+    /// working set rather than accumulating every palette it has repacked. The
+    /// pool then takes a buffer sized to what survived plus the incoming
+    /// section — handing the rest back is the whole point of the ceiling, so
+    /// this is not conditional on the survivors happening not to fit.
+    fn recycle(&mut self, need: usize) {
+        if self.entries.len() < POOL_CEILING_UNITS {
+            let want = (self.used + need).max(self.entries.len() * 2);
+            self.take(want);
+            return;
+        }
+        let keep = (self.starts.len() / 2).max(1);
+        let cut = self.starts.get(self.starts.len() - keep).copied().unwrap_or(self.used);
+        if cut > 0 {
+            self.entries.copy_within(cut..self.used, 0);
+            self.used -= cut;
+            self.starts.retain(|&s| s >= cut);
+            for s in &mut self.starts {
+                *s -= cut;
+            }
+        }
+        self.take((self.used + need).max(POOL_INIT_UNITS));
+    }
+
+    /// Move what the pool holds into a buffer of `want` entries, releasing the
+    /// one it was in.
+    fn take(&mut self, want: usize) {
+        let mut taken = vec![0u16; want].into_boxed_slice();
+        let carried = self.used.min(want);
+        taken[..carried].copy_from_slice(&self.entries[..carried]);
+        self.entries = taken;
+        self.used = carried;
+        self.grows += 1;
     }
 }
 
 /// A section's compressed palette span, registered with the region's
 /// [`SharedRing`] for the closing fold to read once the whole region has been
 /// walked.
+/// The ring outlives whole columns, so it names its spans by where the pool put
+/// them rather than by address — a position is the pool's own coordinate for a
+/// span, and the ring has no business caching anything finer.
 struct SharedSpan {
+    at: usize,
+    len: usize,
+    width: u8,
+    savings: u8,
+}
+
+/// The palette a column's sections inherit from.
+///
+/// It is read once, at the close of the column that committed it, so it takes
+/// the address the pool gave out rather than going back through the pool for a
+/// span that was just handed over.
+#[derive(Clone, Copy)]
+struct BaseSpan {
     ptr: *const u16,
     len: usize,
     width: u8,
@@ -336,6 +410,10 @@ pub fn repack_region(region: &Region, n: usize) -> u64 {
         // digest — the pool and its shared spans are the only things a column
         // shares with the rest of the pass.
         let mut inner = 0xffu64 ^ (col.cid as u64);
+        // The column's first committed palette. A section flagged as sharing
+        // its palette inherits this one, so the column closes its fold against
+        // it rather than against whichever section happened to come last.
+        let mut base: Option<BaseSpan> = None;
         for s in &col.sections {
             if s.palette.is_empty() {
                 continue;
@@ -354,6 +432,7 @@ pub fn repack_region(region: &Region, n: usize) -> u64 {
             // past this section's own scope.
             let ptr = pool.commit(table.entries());
             let len = table.len();
+            let at = pool.used - len;
 
             let packed = pack_bytes_from(ptr, len, width);
             let count = repack::packed_bytes(len, width);
@@ -363,15 +442,27 @@ pub fn repack_region(region: &Region, n: usize) -> u64 {
             // Register this section's span as the newest shared reference,
             // giving the region continuity beyond just each section's
             // immediate use.
-            shared.register(SharedSpan { ptr, len, width, savings });
+            shared.register(SharedSpan { at, len, width, savings });
+            if base.is_none() {
+                base = Some(BaseSpan { ptr, len, width, savings });
+            }
+        }
+
+        // Close the column against the palette its sections inherit from.
+        if let Some(b) = base.as_ref() {
+            let packed = pack_bytes_from(b.ptr, b.len, b.width);
+            let count = repack::packed_bytes(b.len, b.width);
+            inner = inner.wrapping_mul(0x9e3779b97f4a7c15)
+                ^ repack::fold_entries(packed.as_ptr(), count, b.savings);
         }
 
         acc = acc.wrapping_mul(0x100000001b3) ^ inner;
     }
 
-    // Close out the pass by folding in every span the ring holds.
+    // Close out the pass by folding in every span the ring holds, resolved
+    // against wherever the pool has them now.
     for s in shared.spans() {
-        let packed = pack_bytes_from(s.ptr, s.len, s.width);
+        let packed = pack_bytes_from(pool.address(s.at), s.len, s.width);
         let count = repack::packed_bytes(s.len, s.width);
         acc =
             acc.wrapping_mul(0x100000001b3) ^ repack::fold_entries(packed.as_ptr(), count, s.savings);
@@ -383,6 +474,50 @@ pub fn repack_region(region: &Region, n: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Growing at least doubles, so a region with many sections pays a
+    /// logarithmic number of moves — and the pool must not answer that by
+    /// simply reserving the whole region up front, which would make the first
+    /// section's commit size the pass.
+    #[test]
+    fn the_pool_grows_geometrically_and_does_not_over_reserve() {
+        let mut pool = EntryPool::new();
+        for i in 0..600u16 {
+            let _ = pool.commit(&[i, i + 1, i + 2, i + 3]);
+        }
+        assert!(pool.grows > 0, "2400 entries must have outgrown the initial buffer");
+        assert!(
+            pool.grows <= 8,
+            "growth is geometric, so {} moves is too many",
+            pool.grows
+        );
+        assert!(
+            pool.entries.len() <= 4 * pool.used.max(POOL_INIT_UNITS),
+            "the pool reserved {} entries to hold {}",
+            pool.entries.len(),
+            pool.used
+        );
+    }
+
+    /// Past the ceiling the pool must settle at a working set. A region of
+    /// thousands of sections that left every palette resident would be holding
+    /// the whole region's entries at once.
+    #[test]
+    fn the_pool_recycles_rather_than_growing_without_end() {
+        let mut pool = EntryPool::new();
+        for i in 0..4000u16 {
+            let _ = pool.commit(&[i, i + 1, i + 2, i + 3, i + 4, i + 5]);
+        }
+        assert!(
+            pool.entries.len() <= 4 * POOL_CEILING_UNITS,
+            "the pool grew to {} entries for a 24000-entry region",
+            pool.entries.len()
+        );
+        assert!(
+            pool.starts.len() < 4000,
+            "every one of 4000 sections is still resident"
+        );
+    }
 
     #[test]
     fn width_for_is_monotone_and_bounded() {
@@ -500,9 +635,8 @@ mod tests {
     #[test]
     fn shared_ring_holds_only_its_newest_entries() {
         let mut ring = SharedRing::new();
-        let entries = [1u16, 2, 3];
         for len in 1..=(SHARED_SLOTS + 2) {
-            ring.register(SharedSpan { ptr: entries.as_ptr(), len, width: 4, savings: 0 });
+            ring.register(SharedSpan { at: 0, len, width: 4, savings: 0 });
         }
         assert_eq!(ring.spans().count(), SHARED_SLOTS);
         let mut lens: Vec<usize> = ring.spans().map(|s| s.len).collect();

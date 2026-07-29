@@ -21,8 +21,9 @@ pub fn weld_strip(cursor: *mut Vertex, base: usize, count: usize) {
     if cursor.is_null() || count == 0 {
         return;
     }
-    // SAFETY (claimed): the builder reserved the strip's slots before the run
-    // was written, so `cursor.add(base + i)` stays inside the same allocation.
+    // SAFETY: per this function's contract, `cursor` addresses at least
+    // `base + count` initialised slots, so every `cursor.add(base + i)` below
+    // stays inside that allocation.
     unsafe {
         let mut i = 0usize;
         while i + 3 < count {
@@ -36,6 +37,51 @@ pub fn weld_strip(cursor: *mut Vertex, base: usize, count: usize) {
             i += 4;
         }
     }
+}
+
+/// How many corners of each side an adjacency seam covers.
+///
+/// Two columns meet along one quad's worth of edge, so the seam is the trailing
+/// quad of the earlier mesh against the leading quad of the later one.
+const SEAM_CORNERS: usize = 4;
+
+/// Fold the seam between two column meshes that meet along a shared boundary.
+///
+/// `left` is the mesh committed first and `right` the one committed against it.
+/// The fold reads the trailing corners of `left` and the leading corners of
+/// `right` — the two ends that describe the same edge of the world — so a
+/// region's digest reflects how its columns join, not just what each contains.
+/// Both sides are walked through raw pointer arithmetic because a committed
+/// mesh is named by where it landed rather than by an owned buffer.
+///
+/// SAFETY: `left` must address at least `left_len` live [`Vertex`] values and
+/// `right` at least `right_len`, for the duration of the call.
+pub fn fold_boundary(
+    left: *const Vertex,
+    left_len: usize,
+    right: *const Vertex,
+    right_len: usize,
+) -> u64 {
+    if left.is_null() || right.is_null() {
+        return 0;
+    }
+    let take = SEAM_CORNERS.min(left_len).min(right_len);
+    if take == 0 {
+        return 0;
+    }
+    let mut acc = ((left_len ^ right_len) as u64).wrapping_mul(0x9e3779b1);
+    // SAFETY: per this function's contract both sides address at least their
+    // stated vertex counts, and `take` is bounded by both, so the trailing
+    // `take` corners of `left` and the leading `take` of `right` are in range.
+    unsafe {
+        for i in 0..take {
+            let a = *left.add(left_len - take + i);
+            let b = *right.add(i);
+            acc = acc.rotate_left(9) ^ (a.pos as u64) ^ ((a.light as u64) << 5);
+            acc = acc.rotate_left(3) ^ (b.pos as u64) ^ ((b.light as u64) << 1);
+        }
+    }
+    acc
 }
 
 /// Fold a digest of a finished mesh.
@@ -118,6 +164,49 @@ mod tests {
         weld_strip(v.as_mut_ptr(), 0, 0);
         assert_eq!(v, before);
         weld_strip(std::ptr::null_mut(), 0, 4);
+    }
+
+    #[test]
+    fn fold_boundary_reads_both_ends_of_the_seam() {
+        let left = strip(8);
+        let right = strip(8);
+        let base = fold_boundary(left.as_ptr(), left.len(), right.as_ptr(), right.len());
+        // Changing a corner outside the seam must not move the digest.
+        let mut untouched = left.clone();
+        untouched[0].pos ^= 0xff;
+        assert_eq!(
+            base,
+            fold_boundary(untouched.as_ptr(), untouched.len(), right.as_ptr(), right.len())
+        );
+        // Changing the trailing corner of the left side must.
+        let mut moved = left.clone();
+        moved[7].pos ^= 0xff;
+        assert_ne!(
+            base,
+            fold_boundary(moved.as_ptr(), moved.len(), right.as_ptr(), right.len())
+        );
+        // As must changing the leading corner of the right side.
+        let mut other = right.clone();
+        other[0].light ^= 0xff00;
+        assert_ne!(
+            base,
+            fold_boundary(left.as_ptr(), left.len(), other.as_ptr(), other.len())
+        );
+    }
+
+    #[test]
+    fn fold_boundary_clamps_to_the_shorter_side() {
+        let left = strip(8);
+        let short = strip(2);
+        // A two-vertex mesh has no full quad to offer, so only what both sides
+        // carry is folded — and nothing is read past either end.
+        assert_ne!(
+            fold_boundary(left.as_ptr(), left.len(), short.as_ptr(), short.len()),
+            0
+        );
+        assert_eq!(fold_boundary(left.as_ptr(), left.len(), short.as_ptr(), 0), 0);
+        assert_eq!(fold_boundary(std::ptr::null(), 4, short.as_ptr(), 2), 0);
+        assert_eq!(fold_boundary(left.as_ptr(), 4, std::ptr::null(), 2), 0);
     }
 
     #[test]

@@ -5,12 +5,12 @@
 //! kernel cost three pointer walks rather than nine bounds-checked index
 //! operations.
 //!
-//! [`mix_row`] has two call sites in [`crate::biome::resolve_region`]: once per
-//! row as each column is decoded, and once more at the end of the region's
-//! pass for every row its reference ring still holds as a cross-column
-//! reference. Both calls share the same contract — the caller names a live
-//! `(pointer, length)` pair — since this module has no way to tell which kind
-//! of call it is looking at.
+//! The blends here are called from [`crate::biome::resolve_region`] at three
+//! points: [`mix_row`] once per row as each column is decoded and once more at
+//! the end of the region's pass for every row its reference ring still holds,
+//! and [`mix_across`] once per row against the column upstream of it. All three
+//! share the same contract — the caller names a live `(pointer, length)` pair —
+//! since this module has no way to tell which kind of call it is looking at.
 
 /// Weights of the horizontal three-tap kernel, in sixteenths.
 const KERNEL: [u32; 3] = [4, 8, 4];
@@ -38,6 +38,41 @@ pub fn mix_row(view: *const u8, edge: usize, z: u8) -> u64 {
                 + right as u32 * KERNEL[2])
                 / 16;
             acc = acc.rotate_left(5) ^ (mixed as u64);
+        }
+    }
+    acc
+}
+
+/// Blend a row against the same row of the column upstream of it.
+///
+/// The three-tap kernel stops at a column boundary, so a region blended column
+/// by column shows a seam wherever two columns meet. Mixing each row with the
+/// row at the same depth in the column before it is what carries the stencil
+/// across that boundary. Both rows are named by `(pointer, length)` because
+/// [`crate::biome`] addresses committed rows by where the store put them.
+///
+/// SAFETY: `upstream` must address at least `upstream_edge` live cells and
+/// `here` at least `here_edge`, for the duration of the call.
+pub fn mix_across(
+    upstream: *const u8,
+    upstream_edge: usize,
+    here: *const u8,
+    here_edge: usize,
+    z: u8,
+) -> u64 {
+    if upstream.is_null() || here.is_null() || upstream_edge == 0 || here_edge == 0 {
+        return 0;
+    }
+    let mut acc = (z as u64).rotate_left(37) ^ 0x9e3779b1;
+    let edge = upstream_edge.min(here_edge);
+    // SAFETY: per this function's contract each pointer addresses at least the
+    // edge length it is paired with, and `edge` is the smaller of the two.
+    unsafe {
+        for x in 0..edge {
+            let up = *upstream.add(x) as u32;
+            let cur = *here.add(x) as u32;
+            let mixed = (up * KERNEL[0] + cur * KERNEL[1] + up * KERNEL[2]) / 16;
+            acc = acc.rotate_left(7) ^ (mixed as u64);
         }
     }
     acc
@@ -108,6 +143,30 @@ mod tests {
     fn null_or_empty_row_is_zero() {
         assert_eq!(mix_row(std::ptr::null(), 4, 0), 0);
         assert_eq!(mix_slice(&[], 0), 0);
+    }
+
+    #[test]
+    fn mix_across_reflects_both_columns() {
+        let up = [1u8, 2, 3, 4];
+        let here = [5u8, 6, 7, 8];
+        let base = mix_across(up.as_ptr(), 4, here.as_ptr(), 4, 0);
+        let other_up = [9u8, 2, 3, 4];
+        assert_ne!(base, mix_across(other_up.as_ptr(), 4, here.as_ptr(), 4, 0));
+        // The blend is a weighted mean, so a difference has to survive the
+        // division to show up.
+        let other_here = [5u8, 6, 7, 20];
+        assert_ne!(base, mix_across(up.as_ptr(), 4, other_here.as_ptr(), 4, 0));
+        assert_ne!(base, mix_across(up.as_ptr(), 4, here.as_ptr(), 4, 1));
+    }
+
+    #[test]
+    fn mix_across_stops_at_the_shorter_row() {
+        let up = [1u8, 2, 3, 4];
+        let short = [5u8, 6];
+        assert_ne!(mix_across(up.as_ptr(), 4, short.as_ptr(), 2, 0), 0);
+        assert_eq!(mix_across(up.as_ptr(), 4, short.as_ptr(), 0, 0), 0);
+        assert_eq!(mix_across(std::ptr::null(), 4, short.as_ptr(), 2, 0), 0);
+        assert_eq!(mix_across(up.as_ptr(), 4, std::ptr::null(), 2, 0), 0);
     }
 
     #[test]

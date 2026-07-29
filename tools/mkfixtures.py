@@ -156,7 +156,11 @@ def ents(records):
 
 
 def tile(props):
-    """Property tree: (kind, name, value). Only flat Int/Text props here."""
+    """Property tree: (kind, name, value).
+
+    A Compound (kind % 4 == 2) carries its children as its value, encoded as a
+    nested subtree, so a fixture can exercise the decoder's recursion.
+    """
     out = bytearray(u16(len(props)))
     for kind, name, value in props:
         out += u8(kind) + u8(len(name)) + name.encode()
@@ -165,6 +169,8 @@ def tile(props):
         elif kind % 4 == 1:    # Text
             body = str(value).encode()
             out += u8(len(body)) + body
+        elif kind % 4 == 2:    # Compound: children follow as a subtree
+            out += tile(value)
         elif kind % 4 == 3:    # List
             out += u8(len(value))
             for v in value:
@@ -229,9 +235,13 @@ def shallow_column():
     return chunk([layered], base_y=0)
 
 
-def lit_column():
-    """A column flagged as carrying light, for the relight stage."""
-    body = section([0, 5], flags=SEC_HAS_LIGHT, runs=[(128, 1), (128, 0)])
+def lit_column(state=5):
+    """A column flagged as carrying light, for the relight stage.
+
+    `state` sets how opaque the lit half is, which is what makes two such
+    columns differ in mean exposure.
+    """
+    body = section([0, state], flags=SEC_HAS_LIGHT, runs=[(128, 1), (128, 0)])
     return chunk([body], base_y=0)
 
 
@@ -241,41 +251,73 @@ def fixtures():
 
     return {
         "seccache_ok": region(FLAG["seccache"], [col]),
-        # A flat column so the mesher's per-section faces stay distinct.
-        "mesh_ok": region(FLAG["mesh"], [flat]),
+        # Flat columns so the mesher's per-section faces stay distinct, and two
+        # of them so the region has an adjacency seam to weld.
+        "mesh_ok": region(FLAG["mesh"], [flat, flat]),
         "light_ok": region(
             FLAG["light"], [col],
             {b"lgts": lgts([(0, 0x888, 12, False)])},
         ),
+        # Two Transforms among the records, so a component is bound against a
+        # predecessor of its own kind rather than every record standing alone.
         "entity_ok": region(
             FLAG["entity"], [col],
             {b"ents": ents([
                 (1, 0, i32(4) + i32(70) + i32(9)),      # Transform
                 (2, 3, u16(18) + u16(20)),              # Health
+                (3, 0, i32(9) + i32(66) + i32(-4)),     # Transform
             ])},
         ),
+        # A compound so the decoder's recursion is covered, nesting only names
+        # the store already carries.
         "tile_ok": region(
             FLAG["tile"], [col],
-            {b"tile": tile([(0, "x", 3), (0, "y", 71), (1, "id", "chest")])},
+            {b"tile": tile([
+                (0, "x", 3),
+                (0, "y", 71),
+                (2, "Items", [(1, "id", "chest"), (0, "z", 12)]),
+            ])},
         ),
-        # A flat column: nothing overflows the base heightmap span.
-        "height_ok": region(FLAG["height"], [flat], {b"hgts": hgts(6)}),
+        # A flat column opens the pass, a tall one raises the wave, and a
+        # second flat one closes it — so the digest covers a whole wave, not
+        # just one column's slope.
+        "height_ok": region(FLAG["height"], [flat, col, flat], {b"hgts": hgts(6)}),
+        # Two columns, so the blend has a boundary to carry the stencil across.
         "biome_ok": region(
-            FLAG["biome"], [col],
-            {b"biom": biom(4, 0, [4, 4, 5, 5, 4, 5, 5, 6, 5, 5, 6, 6, 5, 6, 6, 6])},
+            FLAG["biome"], [col, col],
+            {b"biom": (
+                biom(4, 0, [4, 4, 5, 5, 4, 5, 5, 6, 5, 5, 6, 6, 5, 6, 6, 6])
+                + biom(5, 0, [5, 5, 6, 6, 5, 6, 6, 7, 6, 6, 7, 7, 6, 7, 7, 7])
+            )},
         ),
+        # Two templates, so the second is positioned against the first.
         "struct_ok": region(
             FLAG["struct"], [col],
             {b"strc": strc([
                 template(1, 2, 70, 3, 1, [(12, 0), (12, 1), (13, 2), (13, 3)]),
+                template(2, 9, 68, 5, 2, [(14, 0), (14, 2), (15, 3), (15, 4)]),
             ])},
         ),
         "tick_ok": region(
             FLAG["tick"], [col],
             # Every queued tick is already due, so the drain keeps them all.
-            {b"tick": tick(1000, [(900, 0x101, 0), (950, 0x202, 1), (1000, 0x303, 2)])},
+            # They are spread far enough apart that the drain cuts several
+            # rounds rather than firing in one pass, and far enough into the
+            # queue that where the last round ends depends on how the earlier
+            # ones went.
+            {b"tick": tick(2000, [
+                (0, 0x101, 0), (100, 0x102, 1),
+                (300, 0x202, 1), (400, 0x203, 2),
+                (600, 0x303, 2), (700, 0x304, 0),
+                (1100, 0x404, 1), (1300, 0x405, 0),
+            ])},
         ),
-        "relight_ok": region(FLAG["relight"], [lit_column()]),
+        # Three dirty columns of differing exposure, so the pass has a
+        # reference column to measure the others against. Well under the
+        # in-flight cap, so no slab is recycled.
+        "relight_ok": region(
+            FLAG["relight"], [lit_column(5), lit_column(11), lit_column(2)],
+        ),
         "palette_ok": region(FLAG["palette"], [col]),
         "verify_ok": region(FLAG["verify"], [col]),
     }

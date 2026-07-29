@@ -95,6 +95,45 @@ pub fn fold_span(ptr: *const LightNode, len: usize) -> u64 {
     acc
 }
 
+/// Fold how far a column's frontier has drifted from the region's seed.
+///
+/// Light propagated column by column accumulates error: each column is solved
+/// against its own emitters, so a region lit in pieces ends up with the pieces
+/// disagreeing at their boundaries. Folding every frontier against the one the
+/// region started from gives the digest a term for that drift. Both sides are
+/// `(pointer, length)` spans into [`crate::light`]'s node arena, walked through
+/// raw pointer arithmetic because a committed frontier is named by where the
+/// arena put it.
+///
+/// SAFETY: `seed` must address at least `seed_len` live [`LightNode`] values
+/// and `here` at least `here_len`, for the duration of the call.
+pub fn fold_drift(
+    seed: *const LightNode,
+    seed_len: usize,
+    here: *const LightNode,
+    here_len: usize,
+) -> u64 {
+    if seed.is_null() || here.is_null() || seed_len == 0 || here_len == 0 {
+        return 0;
+    }
+    let mut acc = (seed_len as u64).rotate_left(29) ^ (here_len as u64);
+    // SAFETY: per this function's contract each pointer addresses at least the
+    // length it is paired with.
+    unsafe {
+        for i in 0..seed_len {
+            let a = *seed.add(i);
+            // The two frontiers are rarely the same depth; the drift term walks
+            // the seed and wraps around this column's own nodes.
+            let b = *here.add(i % here_len);
+            acc = acc.rotate_left(7)
+                ^ ((a.level as u64) << 8)
+                ^ (b.level as u64)
+                ^ ((a.depth ^ b.depth) as u64) << 16;
+        }
+    }
+    acc
+}
+
 /// Fold a digest of one column's light levels.
 pub fn fold_levels(levels: &[u8]) -> u64 {
     let mut acc = (levels.len() as u64).wrapping_mul(0x9e3779b1);
@@ -211,6 +250,28 @@ mod tests {
         let nodes = [node(4)];
         assert_eq!(fold_span(std::ptr::null(), 4), 0);
         assert_eq!(fold_span(nodes.as_ptr(), 0), 0);
+    }
+
+    #[test]
+    fn fold_drift_reflects_both_frontiers() {
+        let seed = [node(9), node(8)];
+        let here = [node(4), node(3)];
+        let base = fold_drift(seed.as_ptr(), 2, here.as_ptr(), 2);
+        let other = [node(4), node(2)];
+        assert_ne!(base, fold_drift(seed.as_ptr(), 2, other.as_ptr(), 2));
+        let moved = [node(7), node(8)];
+        assert_ne!(base, fold_drift(moved.as_ptr(), 2, here.as_ptr(), 2));
+    }
+
+    #[test]
+    fn fold_drift_wraps_a_shorter_column() {
+        let seed = [node(9), node(8), node(7)];
+        let short = [node(4)];
+        // The seed is what is walked; a shorter column is read round-robin and
+        // never past its own end.
+        assert_ne!(fold_drift(seed.as_ptr(), 3, short.as_ptr(), 1), 0);
+        assert_eq!(fold_drift(seed.as_ptr(), 3, short.as_ptr(), 0), 0);
+        assert_eq!(fold_drift(std::ptr::null(), 3, short.as_ptr(), 1), 0);
     }
 
     #[test]

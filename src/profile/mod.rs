@@ -40,6 +40,43 @@ pub fn slope_sum(cursor: *const u16, rows: usize, edge: usize, bias: i32) -> u64
     (acc as u64).wrapping_mul(0x9e3779b1) ^ (edge as u64)
 }
 
+/// The relief of a committed map span: how far its tallest column stands over
+/// its shortest, folded together with where the extremes sit.
+///
+/// [`crate::height`] rebuilds in waves, and a wave's relief is what says whether
+/// the terrain it covered is a plateau or a ridge. The span is named by
+/// `cursor`/`rows` because a committed map is addressed by where the arena put
+/// it rather than by an owned buffer.
+///
+/// SAFETY: `cursor` must address at least `rows * edge` live columns for the
+/// duration of the call.
+pub fn relief(cursor: *const u16, rows: usize, edge: usize) -> u64 {
+    if cursor.is_null() || edge == 0 || rows == 0 {
+        return 0;
+    }
+    let mut lo = u16::MAX;
+    let mut hi = 0u16;
+    let mut at_lo = 0usize;
+    let mut at_hi = 0usize;
+    // SAFETY: guaranteed by the precondition documented above.
+    unsafe {
+        for i in 0..rows * edge {
+            let c = *cursor.add(i);
+            if c < lo {
+                lo = c;
+                at_lo = i;
+            }
+            if c > hi {
+                hi = c;
+                at_hi = i;
+            }
+        }
+    }
+    ((hi - lo) as u64).wrapping_mul(0x9e3779b97f4a7c15)
+        ^ (at_lo as u64).rotate_left(19)
+        ^ (at_hi as u64).rotate_left(41)
+}
+
 /// The tallest and shortest column in a map, as a `(min, max)` pair.
 pub fn span(columns: &[u16]) -> (u16, u16) {
     if columns.is_empty() {
@@ -126,6 +163,26 @@ mod tests {
         // (|1-3|, |2-4|): 1 + 1 + 2 + 2 = 6.
         let expected = (6u64).wrapping_mul(0x9e3779b1) ^ 2;
         assert_eq!(sum, expected);
+    }
+
+    #[test]
+    fn relief_measures_the_gap_and_where_it_sits() {
+        let flat = [5u16; 16];
+        let mut ridge = flat;
+        ridge[9] = 40;
+        assert_ne!(relief(flat.as_ptr(), 4, 4), relief(ridge.as_ptr(), 4, 4));
+        // Same gap, different position: still distinguishable.
+        let mut elsewhere = flat;
+        elsewhere[2] = 40;
+        assert_ne!(relief(ridge.as_ptr(), 4, 4), relief(elsewhere.as_ptr(), 4, 4));
+    }
+
+    #[test]
+    fn relief_of_nothing_is_zero() {
+        let cols = [1u16; 4];
+        assert_eq!(relief(std::ptr::null(), 2, 2), 0);
+        assert_eq!(relief(cols.as_ptr(), 0, 2), 0);
+        assert_eq!(relief(cols.as_ptr(), 2, 0), 0);
     }
 
     #[test]

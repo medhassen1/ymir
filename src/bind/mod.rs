@@ -70,6 +70,43 @@ fn fold_opaque(bytes: &[u8]) -> u64 {
     })
 }
 
+/// Fold a component against the last component of the same kind.
+///
+/// A component's value means little in isolation: a velocity says something
+/// against the velocity before it, a health pool against the one it replaced.
+/// [`crate::entity`] therefore binds each record to its predecessor of the same
+/// kind as the section is walked. Both sides are `(pointer, length)` pairs
+/// resolved out of the store's slots, the same way [`read_component`] takes its
+/// cursor.
+///
+/// SAFETY: `previous` must address at least `previous_len` live bytes and
+/// `here` at least `here_len`, for the duration of the call.
+pub fn fold_succession(
+    previous: *const u8,
+    previous_len: usize,
+    here: *const u8,
+    here_len: usize,
+    kind: Kind,
+) -> u64 {
+    if previous.is_null() || here.is_null() || previous_len == 0 || here_len == 0 {
+        return kind.tag();
+    }
+    // SAFETY: per this function's contract each pointer addresses at least the
+    // length it is paired with.
+    let (before, now) = unsafe {
+        (
+            std::slice::from_raw_parts(previous, previous_len),
+            std::slice::from_raw_parts(here, here_len),
+        )
+    };
+    let mut acc = kind.tag().rotate_left(17) ^ (previous_len as u64) ^ (here_len as u64) << 8;
+    for (i, &b) in before.iter().enumerate() {
+        let against = now.get(i).copied().unwrap_or(0);
+        acc = acc.rotate_left(7) ^ ((b ^ against) as u64) ^ (i as u64);
+    }
+    acc
+}
+
 /// How many bytes a slot of `kind` and wire length `len` actually occupies.
 pub fn footprint(kind: Kind, len: usize) -> usize {
     match kind.stride() {
@@ -133,6 +170,30 @@ mod tests {
         let a = read(&bytes, Kind::Inventory);
         bytes[9..13].copy_from_slice(&99u32.to_be_bytes());
         assert_eq!(a, read(&bytes, Kind::Inventory));
+    }
+
+    #[test]
+    fn fold_succession_reflects_both_records() {
+        let before = [1u8, 2, 3, 4];
+        let now = [1u8, 2, 3, 5];
+        let base = fold_succession(before.as_ptr(), 4, now.as_ptr(), 4, Kind::Health);
+        let other = [1u8, 2, 3, 9];
+        assert_ne!(base, fold_succession(before.as_ptr(), 4, other.as_ptr(), 4, Kind::Health));
+        assert_ne!(base, fold_succession(other.as_ptr(), 4, now.as_ptr(), 4, Kind::Health));
+        assert_ne!(base, fold_succession(before.as_ptr(), 4, now.as_ptr(), 4, Kind::Blob));
+    }
+
+    #[test]
+    fn fold_succession_of_nothing_yields_the_kind_tag() {
+        let now = [1u8, 2];
+        assert_eq!(
+            fold_succession(std::ptr::null(), 4, now.as_ptr(), 2, Kind::Blob),
+            Kind::Blob.tag()
+        );
+        assert_eq!(
+            fold_succession(now.as_ptr(), 0, now.as_ptr(), 2, Kind::Blob),
+            Kind::Blob.tag()
+        );
     }
 
     #[test]

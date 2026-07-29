@@ -119,14 +119,12 @@ impl CellArena {
 
     /// Return the bump cursor to `mark`.
     ///
-    /// A mark taken in a block that has since been replaced names space that
-    /// no longer exists. The replacement block started empty and has only
-    /// staged what came after the mark, so there is nothing to give back and
-    /// the rewind does nothing.
+    /// A mark taken in a block that has since been replaced names space that no
+    /// longer exists — but the replacement block started empty and has only
+    /// staged what came *after* that mark, so everything in it is equally dead
+    /// and the cursor goes back to the front of it.
     fn rewind(&mut self, mark: Mark) {
-        if mark.generation == self.generation {
-            self.used = mark.used;
-        }
+        self.used = if mark.generation == self.generation { mark.used } else { 0 };
     }
 
     /// Stage `cells` into the arena and return a pointer to where they landed.
@@ -151,7 +149,18 @@ impl CellArena {
 
 /// A staged template kept as a positioning anchor for the region's closing
 /// pass to fold — see [`instance_region`].
+///
+/// The closing pass walks the ring exactly once, so it takes the address the
+/// arena gave out rather than resolving an offset per anchor.
 struct Anchor {
+    ptr: *const Cell,
+    len: usize,
+}
+
+/// The structure every later placement is positioned against, kept from the
+/// first template that resolved to one and read once per template after it.
+#[derive(Clone, Copy)]
+struct Lead {
     ptr: *const Cell,
     len: usize,
 }
@@ -183,6 +192,7 @@ impl AnchorRing {
     fn anchors(&self) -> impl Iterator<Item = &Anchor> {
         self.slots.iter().flatten()
     }
+
 }
 
 /// Where a template resolve stages what it produces: the arena the cells land
@@ -190,11 +200,13 @@ impl AnchorRing {
 struct Staging {
     arena: CellArena,
     anchors: AnchorRing,
+    /// Where the most recently recorded template was staged.
+    last: Option<Lead>,
 }
 
 impl Staging {
     fn new() -> Staging {
-        Staging { arena: CellArena::new(), anchors: AnchorRing::new() }
+        Staging { arena: CellArena::new(), anchors: AnchorRing::new(), last: None }
     }
 
     /// Stage a resolved template's cells and register them as an anchor.
@@ -208,6 +220,7 @@ impl Staging {
         }
         let ptr = self.arena.stage(cells);
         self.anchors.register(Anchor { ptr, len: cells.len() });
+        self.last = Some(Lead { ptr, len: cells.len() });
     }
 }
 
@@ -335,6 +348,10 @@ pub fn instance_region(region: &Region, n: usize) -> u64 {
     // sized like the other bump-packing stores: from the region's own rebuild
     // pressure rather than a fixed guess.
     let mut marks = vec![0u8; budget::store_bytes(region, n)];
+    // The first structure the region resolved. Later placements are positioned
+    // relative to it, the way outbuildings sit against the settlement they
+    // belong to rather than at absolute coordinates.
+    let mut lead: Option<Lead> = None;
     let mut acc = 0xffu64 ^ (n as u64);
 
     for _ in 0..count.min(MAX_STACK) {
@@ -352,6 +369,18 @@ pub fn instance_region(region: &Region, n: usize) -> u64 {
         // owns for the whole call.
         acc = acc.wrapping_mul(0x100000001b3)
             ^ graft::stamp(cells.as_ptr(), cells.len(), placement, region.seed, &mut marks);
+
+        // Position this placement against the structure the region led with,
+        // resolved against whichever block the arena holds now.
+        match lead.as_ref() {
+            Some(l) => {
+                acc = acc.wrapping_mul(0x9e3779b97f4a7c15)
+                    ^ graft::fold_relative(l.ptr, l.len, placement)
+            }
+            // The first structure to resolve is what the rest are placed
+            // against; it is staged, so the arena is where it is named from.
+            None => lead = stage.last,
+        }
     }
 
     // Close out the pass by folding in every anchor the ring holds, measuring
@@ -365,6 +394,40 @@ pub fn instance_region(region: &Region, n: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rewinding as recursion unwinds is the arena's bound: the space a
+    /// finished subtree was staged in has to come back, or a long template list
+    /// grows the block once per template however small each one is.
+    #[test]
+    fn rewinding_keeps_the_block_flat_over_a_long_template_list() {
+        let mut arena = CellArena::new();
+        let run: Vec<Cell> = (0..64).map(|i| Cell { state: i as u16, dy: 0 }).collect();
+        for _ in 0..400 {
+            let entry = arena.mark();
+            let _ = arena.stage(&run);
+            arena.rewind(entry);
+        }
+        assert_eq!(arena.generation, 0, "a rewound arena must never need a new block");
+        assert_eq!(arena.block.len(), BLOCK_CELLS);
+    }
+
+    /// Replacement at least doubles, so a subtree too large for the current
+    /// block costs a logarithmic number of blocks rather than one per template.
+    #[test]
+    fn the_cell_arena_replaces_its_block_geometrically() {
+        let mut arena = CellArena::new();
+        let run: Vec<Cell> = (0..64).map(|i| Cell { state: i as u16, dy: 0 }).collect();
+        // Nothing is rewound here, so this is one subtree that keeps growing.
+        for _ in 0..400 {
+            let _ = arena.stage(&run);
+        }
+        assert!(arena.generation > 0, "400 stagings must have outgrown one block");
+        assert!(
+            arena.generation <= 8,
+            "replacement is geometric, so {} blocks is too many",
+            arena.generation
+        );
+    }
 
     fn template_bytes(id: u16, cells: &[(u16, i16)]) -> Vec<u8> {
         let mut v = Vec::new();
@@ -506,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn rewinding_into_a_replaced_block_does_nothing() {
+    fn rewinding_into_a_replaced_block_empties_it() {
         let mut arena = CellArena::new();
         arena.stage(&cells(4));
         let mark = arena.mark();
@@ -515,7 +578,9 @@ mod tests {
         assert_eq!(arena.generation, 1);
         assert_eq!(arena.used, BLOCK_CELLS);
         arena.rewind(mark);
-        assert_eq!(arena.used, BLOCK_CELLS, "a mark from a released block gives nothing back");
+        // The replacement block holds only what was staged after the mark, so
+        // rewinding past the mark makes the whole of it dead.
+        assert_eq!(arena.used, 0);
     }
 
     #[test]

@@ -67,6 +67,69 @@ pub fn fold_anchor(ptr: *const TickEntry, len: usize) -> u64 {
     acc
 }
 
+/// Fold how far a round has drifted from the round two windows before it.
+///
+/// Consecutive rounds share a due-time boundary, so ranking a round against its
+/// immediate predecessor mostly measures that boundary rather than the
+/// scheduler's drift. Reaching back a round further is what makes the term mean
+/// something. Both rounds are named by `(pointer, length)` because a staged
+/// round is addressed by the buffer the drain put it in.
+///
+/// SAFETY: `earlier` must address at least `earlier_len` live [`TickEntry`]
+/// values and `here` at least `here_len`, for the duration of the call.
+pub fn fold_drift(
+    earlier: *const TickEntry,
+    earlier_len: usize,
+    here: *const TickEntry,
+    here_len: usize,
+) -> u64 {
+    if earlier.is_null() || here.is_null() || earlier_len == 0 || here_len == 0 {
+        return 0;
+    }
+    let mut acc = (earlier_len as u64).rotate_left(31) ^ (here_len as u64);
+    let span = earlier_len.min(here_len);
+    // SAFETY: per this function's contract each pointer addresses at least the
+    // length it is paired with, and `span` is the smaller of the two.
+    unsafe {
+        for i in 0..span {
+            let a = *earlier.add(i);
+            let b = *here.add(i);
+            acc = acc.rotate_left(11) ^ rank_against(&b, &a);
+        }
+    }
+    acc
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    fn entry(at: u32, pri: u8) -> TickEntry {
+        TickEntry { at_tick: at, target: 1, priority: pri, sub_order: 0 }
+    }
+
+    #[test]
+    fn fold_drift_reflects_both_rounds() {
+        let earlier = [entry(10, 1), entry(20, 2)];
+        let here = [entry(40, 1), entry(50, 2)];
+        let base = fold_drift(earlier.as_ptr(), 2, here.as_ptr(), 2);
+        let moved = [entry(40, 1), entry(90, 2)];
+        assert_ne!(base, fold_drift(earlier.as_ptr(), 2, moved.as_ptr(), 2));
+        let shifted = [entry(11, 1), entry(20, 2)];
+        assert_ne!(base, fold_drift(shifted.as_ptr(), 2, here.as_ptr(), 2));
+    }
+
+    #[test]
+    fn fold_drift_stops_at_the_shorter_round() {
+        let earlier = [entry(10, 1), entry(20, 2), entry(30, 3)];
+        let short = [entry(40, 1)];
+        assert_ne!(fold_drift(earlier.as_ptr(), 3, short.as_ptr(), 1), 0);
+        assert_eq!(fold_drift(earlier.as_ptr(), 3, short.as_ptr(), 0), 0);
+        assert_eq!(fold_drift(std::ptr::null(), 3, short.as_ptr(), 1), 0);
+        assert_eq!(fold_drift(earlier.as_ptr(), 3, std::ptr::null(), 1), 0);
+    }
+}
+
 /// The span of due times across a set of entries, as `(earliest, latest)`.
 pub fn time_span(entries: &[TickEntry]) -> (u32, u32) {
     if entries.is_empty() {

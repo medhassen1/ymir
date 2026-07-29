@@ -388,6 +388,9 @@ pub fn resolve_region(region: &Region) -> u64 {
 
     let mut store = RowStore::new();
     let mut ring = ReferenceRing::new();
+    // The column decoded on the previous turn, held so the stencil can reach
+    // across the boundary between the two.
+    let mut upstream: Option<ColumnView> = None;
     let mut acc = 0xffu64;
 
     for cid in 0..n {
@@ -417,10 +420,26 @@ pub fn resolve_region(region: &Region) -> u64 {
             acc = acc.wrapping_mul(0x100000001b3) ^ blend::mix_row(ptr, len, z as u8);
         }
 
+        // Carry the stencil across the boundary with the column upstream of
+        // this one, row by row at matching depths.
+        if let Some(u) = upstream.as_ref() {
+            for &z in &rows_to_blend {
+                acc = acc.wrapping_mul(0x9e3779b97f4a7c15)
+                    ^ blend::mix_across(
+                        u.row_ptr(z),
+                        u.row_len(z),
+                        view.row_ptr(z),
+                        view.row_len(z),
+                        z as u8,
+                    );
+            }
+        }
+
         // Register this column's opening row as the newest cross-column
         // reference, giving the region continuity beyond just each column's
         // immediate predecessor.
         ring.register(ReferenceRow { ptr: view.row_ptr(0), len: view.row_len(0), z: 0 });
+        upstream = Some(view);
     }
 
     // Close out the pass by folding in every reference row the ring holds.
@@ -434,6 +453,28 @@ pub fn resolve_region(region: &Region) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compaction is the store's bound. A region of many columns must leave it
+    /// holding a working set, not every column it ever decoded — and it must
+    /// not reach that by simply reserving the whole region up front.
+    #[test]
+    fn the_row_store_stays_bounded_over_a_long_region() {
+        let mut store = RowStore::new();
+        let cells = vec![3u8; GRID_EDGE * GRID_EDGE];
+        for _ in 0..400 {
+            let _ = store.commit(&cells);
+        }
+        assert!(
+            store.extents.len() < 400,
+            "every one of 400 columns is still resident"
+        );
+        assert!(
+            store.bytes.len() <= 8 * cells.len(),
+            "the store reserved {} bytes to hold {} columns",
+            store.bytes.len(),
+            store.extents.len()
+        );
+    }
 
     #[test]
     fn uniform_grid_reports_one_biome() {

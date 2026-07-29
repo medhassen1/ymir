@@ -88,54 +88,59 @@ fn golden_seccache() {
     assert_eq!(digest("seccache_ok"), 0xa6a73bfb15d4f789);
 }
 
+/// The mesh fixture carries two columns, so its digest covers the adjacency
+/// seam between them as well as each column's own mesh. Dropping either fold
+/// moves this value.
 #[test]
 fn golden_mesh() {
-    assert_eq!(digest("mesh_ok"), 0x9a3376c4b9e012e4);
+    assert_eq!(digest("mesh_ok"), 0x7c269e4de19a349b);
 }
 
 #[test]
 fn golden_light() {
-    assert_eq!(digest("light_ok"), 0x66b0629756d0d7fb);
+    assert_eq!(digest("light_ok"), 0xe400cedf0f78378d);
 }
 
 #[test]
 fn golden_entity() {
-    assert_eq!(digest("entity_ok"), 0x0ce5bc93350d5502);
+    assert_eq!(digest("entity_ok"), 0xdc73198f107189db);
 }
 
 #[test]
 fn golden_tile() {
-    assert_eq!(digest("tile_ok"), 0xc3e0d2e5add3aebf);
+    assert_eq!(digest("tile_ok"), 0x4c2d71941b79b673);
 }
 
 #[test]
 fn golden_height() {
-    assert_eq!(digest("height_ok"), 0x034e260002ced7a1);
+    assert_eq!(digest("height_ok"), 0x06b3eaec900131f5);
 }
 
 #[test]
 fn golden_biome() {
-    assert_eq!(digest("biome_ok"), 0x49cb7d0e3c130f6b);
+    assert_eq!(digest("biome_ok"), 0x794d12ff12ed85cd);
 }
 
 #[test]
 fn golden_struct() {
-    assert_eq!(digest("struct_ok"), 0x033badf4655239a1);
+    assert_eq!(digest("struct_ok"), 0xa0028d90b252a25d);
 }
 
 #[test]
 fn golden_tick() {
-    assert_eq!(digest("tick_ok"), 0x01adbd85aab683f1);
+    assert_eq!(digest("tick_ok"), 0x3c1ef2e5778d13f5);
 }
 
+/// Three dirty columns of differing exposure, so this digest covers the
+/// reference-drift fold as well as each column's own levels.
 #[test]
 fn golden_relight() {
-    assert_eq!(digest("relight_ok"), 0x03619a0002de93d7);
+    assert_eq!(digest("relight_ok"), 0xa938ae1ccf43d4c7);
 }
 
 #[test]
 fn golden_palette() {
-    assert_eq!(digest("palette_ok"), 0x09f5cbfca1d9a328);
+    assert_eq!(digest("palette_ok"), 0xe06bb0d99e9a0e5c);
 }
 
 /// The VERIFY bit selects no stage, so it must rebuild exactly as the default

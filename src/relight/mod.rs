@@ -135,14 +135,30 @@ impl SlabPool {
     }
 }
 
-/// A column's slab left with the ring for the closing anneal to fold, once the
-/// whole dirty set has been walked.
+/// A column's levels left with the ring for the closing anneal to fold, once
+/// the whole dirty set has been walked.
+///
+/// The ring names where the levels stood rather than which slab holds them: the
+/// closing fold is one walk over a handful of spans and re-entering the pool for
+/// each would put an indirection in front of every read for nothing.
 struct Deferred {
-    /// The slab this column's levels were packed into.
-    slab: usize,
+    /// The first level of this column's packed run.
+    base: *const u8,
     /// How many levels this column contributed. A slab can be larger than the
     /// column that took it (see [`SLAB_SLACK`]), so the count is what bounds
     /// the fold rather than the slab's own length.
+    count: usize,
+}
+
+/// The column the pass measures every later column's exposure against.
+///
+/// It is read once per dirty column rather than once at the end, so it names
+/// its slab: going through the pool per read costs an index, where caching the
+/// address would spend a word of the drain's hot state on every column.
+struct Reference {
+    /// The slab the reference column's levels were packed into.
+    slab: usize,
+    /// How many levels that column contributed.
     count: usize,
 }
 
@@ -183,6 +199,11 @@ impl DeferRing {
 /// giving a later column's anneal a cross-region neighbour beyond just its
 /// immediate predecessor. The neighbours the ring still holds are folded once
 /// more at the end, closing out the pass.
+///
+/// Beside that, the pass keeps one *reference* column — the brightest it has
+/// relit so far — and measures each later column against it, so the digest
+/// carries how far the region drifts from its own brightest exposure rather
+/// than only what each column contains.
 pub fn incremental(region: &Region, n: usize) -> u64 {
     let dirty = dirty_columns(region, n);
     if dirty.is_empty() {
@@ -192,19 +213,34 @@ pub fn incremental(region: &Region, n: usize) -> u64 {
     let mut pool = SlabPool::new();
     let mut ring = DeferRing::new();
     let mut in_flight: VecDeque<usize> = VecDeque::new();
+    let mut reference: Option<Reference> = None;
+    let mut reference_mean = 0u32;
     let mut acc = 0xffu64;
 
     for (i, col) in dirty.iter().enumerate() {
         let levels = column_levels(col);
         let count = levels.len();
+        let mean = anneal::mean_level(&levels);
         let slab = pool.issue(&levels);
         acc = acc.wrapping_mul(0x100000001b3) ^ anneal::fold_one(pool.base(slab), count);
 
-        // Every `DEFER_STRIDE`-th column leaves its slab for the closing
+        // Measure this column against the region's reference exposure before
+        // considering whether it becomes the reference itself — a column
+        // measured against its own levels says nothing about drift.
+        if let Some(r) = reference.as_ref() {
+            acc = acc.wrapping_mul(0x100000001b3)
+                ^ anneal::fold_against(pool.base(r.slab), r.count, pool.base(slab), count);
+        }
+        if reference.is_none() || mean > reference_mean {
+            reference = Some(Reference { slab, count });
+            reference_mean = mean;
+        }
+
+        // Every `DEFER_STRIDE`-th column leaves its levels for the closing
         // anneal to fold, giving the pass continuity beyond just each column's
         // immediate predecessor.
         if i % DEFER_STRIDE == 0 {
-            ring.defer(Deferred { slab, count });
+            ring.defer(Deferred { base: pool.base(slab), count });
         }
 
         // This column's slab stays out while later columns might still anneal
@@ -218,10 +254,10 @@ pub fn incremental(region: &Region, n: usize) -> u64 {
         }
     }
 
-    // Close out the pass by folding every deferred neighbour once, resolving
-    // its slab afresh now that the whole dirty set has been walked.
+    // Close out the pass by folding every deferred neighbour once, now that the
+    // whole dirty set has been walked.
     for d in ring.neighbours() {
-        acc = acc.wrapping_mul(0x100000001b3) ^ anneal::fold_one(pool.base(d.slab), d.count);
+        acc = acc.wrapping_mul(0x100000001b3) ^ anneal::fold_one(d.base, d.count);
     }
     acc
 }
@@ -303,16 +339,41 @@ mod tests {
         assert_eq!(pool.slabs[b].len(), SLAB_SLACK, "the slab must be refitted to the column");
     }
 
+    /// Recycling is the whole point of the pool: however many columns a region
+    /// marks dirty, the pass must keep allocating the same handful of slabs
+    /// rather than one per column.
+    #[test]
+    fn the_pool_stays_flat_over_a_heavily_dirtied_region() {
+        let mut pool = SlabPool::new();
+        let mut in_flight: VecDeque<usize> = VecDeque::new();
+        for i in 0..200usize {
+            let slab = pool.issue(&vec![(i % 16) as u8; 64 + i % 32]);
+            in_flight.push_back(slab);
+            if in_flight.len() > IN_FLIGHT_SLABS {
+                if let Some(oldest) = in_flight.pop_front() {
+                    pool.release(oldest);
+                }
+            }
+        }
+        assert!(
+            pool.slabs.len() <= IN_FLIGHT_SLABS + 1,
+            "the pool grew with the dirty set: {} slabs allocated",
+            pool.slabs.len()
+        );
+    }
+
     #[test]
     fn defer_ring_holds_only_its_newest_entries() {
+        let mut pool = SlabPool::new();
         let mut ring = DeferRing::new();
-        for slab in 0..DEFER_SLOTS + 2 {
-            ring.defer(Deferred { slab, count: slab });
+        for count in 0..DEFER_SLOTS + 2 {
+            let slab = pool.issue(&vec![count as u8; count + 1]);
+            ring.defer(Deferred { base: pool.base(slab), count });
         }
         assert_eq!(ring.neighbours().count(), DEFER_SLOTS);
-        let mut slabs: Vec<usize> = ring.neighbours().map(|d| d.slab).collect();
-        slabs.sort_unstable();
-        assert_eq!(slabs, vec![2, 3, 4, 5]);
+        let mut counts: Vec<usize> = ring.neighbours().map(|d| d.count).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![2, 3, 4, 5]);
     }
 
     #[test]

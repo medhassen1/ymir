@@ -143,6 +143,14 @@ const ROUND_SIZE: usize = 32;
 /// region with a long due window drains in waves instead of in one pass.
 const WINDOW_TICKS: u32 = 256;
 
+/// How much larger than the round taking it a reused side may be.
+///
+/// Rounds within a factor of this of each other share a buffer, which is the
+/// point of keeping two. A side holding very much more than the round needs is
+/// re-taken instead, so a drain that opened on a wide due window does not carry
+/// that buffer for every narrow round after it.
+const SIDE_SLACK: usize = 4;
+
 /// Cross-round anchors the carry ring keeps addressable at once.
 ///
 /// Four is enough for the closing pass to rank against a handful of recent
@@ -161,11 +169,18 @@ struct RoundBuffers {
     sides: [Option<Box<[TickEntry]>>; 2],
     /// The side the next round stages into.
     flip: usize,
+    /// How many buffers the pair has had to take.
+    taken: usize,
 }
 
 impl RoundBuffers {
     fn new() -> RoundBuffers {
-        RoundBuffers { sides: [None, None], flip: 0 }
+        RoundBuffers { sides: [None, None], flip: 0, taken: 0 }
+    }
+
+    /// Which side the next [`RoundBuffers::stage`] will write to.
+    fn next_side(&self) -> usize {
+        self.flip
     }
 
     /// Stage `round` into the next side and return a pointer to where it
@@ -176,25 +191,51 @@ impl RoundBuffers {
     fn stage(&mut self, round: &[TickEntry]) -> *const TickEntry {
         let side = self.flip;
         self.flip ^= 1;
-        let reusable = self.sides[side].as_ref().is_some_and(|b| b.len() >= round.len());
+        let held = self.sides[side].as_ref().map_or(0, |b| b.len());
+        // A side is reused when what is there fits the round without being so
+        // much larger than it that the drain would carry the widest window it
+        // ever saw for the rest of the pass.
+        let reusable = held >= round.len() && held <= round.len() * SIDE_SLACK;
         if reusable {
             let buffer = self.sides[side].as_mut().expect("the side was just found reusable");
             buffer[..round.len()].copy_from_slice(round);
         } else {
-            // Nothing on this side yet, or what is there is too small for the
-            // incoming round: the side takes a buffer sized to this round and
-            // releases whatever it displaces.
+            // Nothing on this side yet, or what is there is the wrong size for
+            // the incoming round: the side takes a buffer sized to this round
+            // and releases whatever it displaces.
             self.sides[side] = Some(round.to_vec().into_boxed_slice());
+            self.taken += 1;
         }
         let buffer = self.sides[side].as_ref().expect("the side holds a buffer either way");
         buffer.as_ptr()
+    }
+
+    /// The first entry of whatever `side` currently holds, or null if that side
+    /// has never been staged into.
+    fn side_base(&self, side: usize) -> *const TickEntry {
+        match self.sides.get(side).and_then(Option::as_ref) {
+            Some(buffer) => buffer.as_ptr(),
+            None => std::ptr::null(),
+        }
     }
 }
 
 /// A round staged into [`RoundBuffers`] and carried past its own turn, for the
 /// drain's closing cross-round ranking pass to read.
+///
+/// The closing pass walks the ring exactly once, so it takes the address the
+/// buffers gave out rather than going back through them per round.
 struct CarriedRound {
     ptr: *const TickEntry,
+    len: usize,
+}
+
+/// A round the drain measures a later round's drift against, named by the side
+/// it was staged on: the drain already knows which side it wrote, so carrying
+/// that costs nothing over carrying the address it was given.
+#[derive(Clone, Copy)]
+struct StagedRound {
+    side: usize,
     len: usize,
 }
 
@@ -227,16 +268,59 @@ impl CarryRing {
     }
 }
 
+/// Fill, in entries, at which the drain considers a round well used.
+///
+/// A round around this size is the scheduler keeping pace: enough work to be
+/// worth the round's overhead, not so much that it is running late.
+const CADENCE_TARGET: usize = ROUND_SIZE / 2;
+
+/// How far a round's fill may drift from [`CADENCE_TARGET`], accumulated over
+/// the rounds fired so far, before the drain changes its window width.
+const CADENCE_STEP: i32 = ROUND_SIZE as i32;
+
+/// The due-time window the drain is currently cutting rounds on.
+///
+/// A fixed window suits a queue whose work is spread evenly and nothing else. A
+/// drain that keeps firing near-empty rounds is running ahead of its work and
+/// paying a round's overhead for a handful of ticks, so it widens the window to
+/// gather more; one that keeps hitting the entry cap is running late and
+/// narrows it to stay responsive. The width therefore depends on every round
+/// fired before it, not on the round about to be cut.
+struct Cadence {
+    width: u32,
+    drift: i32,
+}
+
+impl Cadence {
+    fn new() -> Cadence {
+        Cadence { width: WINDOW_TICKS, drift: 0 }
+    }
+
+    /// Fold a fired round's fill into the cadence.
+    fn settle(&mut self, fired: usize) {
+        self.drift += CADENCE_TARGET as i32 - fired as i32;
+        if self.drift > CADENCE_STEP {
+            self.width = (self.width * 2).min(WINDOW_TICKS * 16);
+            self.drift = 0;
+        } else if self.drift < -CADENCE_STEP {
+            self.width = (self.width / 2).max(1);
+            self.drift = 0;
+        }
+    }
+}
+
 /// How far the round starting at `entries[i]` reaches.
 ///
 /// A round runs to the end of the due-time window its first entry falls in, or
-/// to [`ROUND_SIZE`] entries, whichever comes first. The queue is ordered by
-/// due time before this is called, so a window's entries are contiguous.
-fn round_end(entries: &[TickEntry], i: usize) -> usize {
-    let window = entries[i].at_tick / WINDOW_TICKS;
+/// to [`ROUND_SIZE`] entries, whichever comes first. `width` is the window the
+/// drain's [`Cadence`] has settled on. The queue is ordered by due time before
+/// this is called, so a window's entries are contiguous.
+fn round_end(entries: &[TickEntry], i: usize, width: u32) -> usize {
+    let width = width.max(1);
+    let window = entries[i].at_tick / width;
     let cap = (i + ROUND_SIZE).min(entries.len());
     let mut end = i + 1;
-    while end < cap && entries[end].at_tick / WINDOW_TICKS == window {
+    while end < cap && entries[end].at_tick / width == window {
         end += 1;
     }
     end
@@ -246,7 +330,9 @@ fn round_end(entries: &[TickEntry], i: usize) -> usize {
 ///
 /// The due queue is ordered once, then cut into rounds — one per due-time
 /// window, capped at [`ROUND_SIZE`] entries — rather than fired in a single
-/// pass. Each round is staged into the drain's [`RoundBuffers`] and fired
+/// pass. How wide that window is is not fixed: the drain's [`Cadence`] widens
+/// it while rounds keep coming up thin and narrows it while they keep hitting
+/// the cap, so where a round ends depends on every round fired before it. Each round is staged into the drain's [`RoundBuffers`] and fired
 /// immediately, and carried in the [`CarryRing`] as a cross-round anchor. Once
 /// every round has fired, the drain's closing pass ranks the anchors the ring
 /// still holds, measuring a round's drift from one whose own turn has already
@@ -274,20 +360,36 @@ pub fn drain_region(region: &Region, n: usize) -> u64 {
     let entries = queue.entries();
     let mut buffers = RoundBuffers::new();
     let mut carried = CarryRing::new();
+    // The two rounds behind the one being fired, so drift can be measured
+    // against the round a window further back than the immediate predecessor.
+    let mut one_back: Option<StagedRound> = None;
+    let mut two_back: Option<StagedRound> = None;
     let mut acc = 0xffu64 ^ (n as u64);
 
+    let mut cadence = Cadence::new();
     let mut i = 0;
     while i < entries.len() {
-        let end = round_end(entries, i);
+        let end = round_end(entries, i, cadence.width);
         let round = &entries[i..end];
+        cadence.settle(round.len());
 
         // Stage this round into the drain's buffers. Only past this point is
         // there a pointer stable enough to carry past this round's own turn.
+        let side = buffers.next_side();
         let ptr = buffers.stage(round);
 
         // Fire the round immediately while its staged span is still fresh off
         // the flip.
         acc = acc.wrapping_mul(0x100000001b3) ^ drain::fire(round, ptr, slack.max(round.len()));
+
+        // Measure this round's drift from the round two windows back, resolved
+        // against whatever that side holds now.
+        if let Some(p) = two_back.as_ref() {
+            acc = acc.wrapping_mul(0x9e3779b97f4a7c15)
+                ^ drain::fold_drift(buffers.side_base(p.side), p.len, ptr, round.len());
+        }
+        two_back = one_back.take();
+        one_back = Some(StagedRound { side, len: round.len() });
 
         // Carry the round as the newest cross-round anchor.
         carried.carry(CarriedRound { ptr, len: round.len() });
@@ -375,14 +477,18 @@ mod tests {
     #[test]
     fn a_round_stops_at_the_window_boundary() {
         let e = vec![entry(0, 0, 0), entry(1, 0, 1), entry(WINDOW_TICKS, 0, 2)];
-        assert_eq!(round_end(&e, 0), 2, "the third entry is in the next window");
-        assert_eq!(round_end(&e, 2), 3);
+        assert_eq!(
+            round_end(&e, 0, WINDOW_TICKS),
+            2,
+            "the third entry is in the next window"
+        );
+        assert_eq!(round_end(&e, 2, WINDOW_TICKS), 3);
     }
 
     #[test]
     fn a_round_stops_at_the_batch_size() {
         let e = entries(ROUND_SIZE + 8);
-        assert_eq!(round_end(&e, 0), ROUND_SIZE);
+        assert_eq!(round_end(&e, 0, WINDOW_TICKS), ROUND_SIZE);
     }
 
     #[test]
@@ -398,6 +504,41 @@ mod tests {
             assert_eq!((*a.add(3)).at_tick, 3);
             assert_eq!((*b.add(1)).at_tick, 1);
         }
+    }
+
+    /// Keeping two buffers only pays if rounds reuse them. A drain of many
+    /// rounds that all fit must take two buffers and no more, however long the
+    /// due queue is.
+    #[test]
+    fn round_buffers_stop_allocating_once_both_sides_are_wide_enough() {
+        let mut buffers = RoundBuffers::new();
+        let wide = entries(ROUND_SIZE);
+        buffers.stage(&wide);
+        buffers.stage(&wide);
+        assert_eq!(buffers.taken, 2, "each side takes one buffer to start");
+        // Rounds within the slack band of what the sides hold reuse them.
+        for len in (ROUND_SIZE / SIDE_SLACK)..=ROUND_SIZE {
+            buffers.stage(&entries(len));
+        }
+        assert_eq!(
+            buffers.taken, 2,
+            "rounds inside the slack band must reuse the pair, not replace it"
+        );
+    }
+
+    /// The other half of the same contract: a side holding very much more than
+    /// the round needs is re-taken, so a drain that opened on a wide window
+    /// does not carry that buffer through every narrow round after it.
+    #[test]
+    fn a_side_far_wider_than_its_round_is_re_taken() {
+        let mut buffers = RoundBuffers::new();
+        let wide = entries(ROUND_SIZE);
+        buffers.stage(&wide);
+        buffers.stage(&wide);
+        let before = buffers.taken;
+        buffers.stage(&entries(1));
+        assert_eq!(buffers.taken, before + 1, "a far-oversized side must be re-taken");
+        assert_eq!(buffers.sides[0].as_ref().expect("staged").len(), 1);
     }
 
     #[test]

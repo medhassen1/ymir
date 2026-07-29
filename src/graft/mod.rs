@@ -104,6 +104,32 @@ pub fn fold_parent(cells: *const Cell, len: usize) -> u64 {
     acc
 }
 
+/// Fold a placement against the structure it is positioned relative to.
+///
+/// A region's structures are not placed independently: a well is dug beside the
+/// village it belongs to, not at an absolute coordinate, so a placement carries
+/// meaning only against the structure the region led with. `lead`/`len` name
+/// that structure's staged cells and `at` is where this placement landed.
+///
+/// SAFETY: `lead` must address at least `len` live [`Cell`] values for the
+/// call.
+pub fn fold_relative(lead: *const Cell, len: usize, at: Placement) -> u64 {
+    if lead.is_null() || len == 0 {
+        return 0;
+    }
+    let mut acc = placement_seed(at, len as u32);
+    // SAFETY: per this function's contract, the caller guarantees `lead`
+    // addresses at least `len` live cells.
+    unsafe {
+        for i in 0..len {
+            let c = *lead.add(i);
+            let offset = c.dy.wrapping_sub(at.y);
+            acc = acc.rotate_left(13) ^ (c.state as u64) ^ ((offset as i64 as u64) << 8);
+        }
+    }
+    acc
+}
+
 /// The digest seed for a placement: its origin, rotation and the world seed.
 fn placement_seed(at: Placement, seed: u32) -> u64 {
     let mut h = seed as u64 ^ 0x9e3779b97f4a7c15;
@@ -111,6 +137,31 @@ fn placement_seed(at: Placement, seed: u32) -> u64 {
     h = h.wrapping_mul(0x100000001b3) ^ (at.z as i64 as u64);
     h = h.rotate_left(at.rot as u32 * 8 + 1);
     h
+}
+
+#[cfg(test)]
+mod relative_tests {
+    use super::*;
+
+    fn at(y: i16) -> Placement {
+        Placement { x: 3, y, z: 5, rot: 1 }
+    }
+
+    #[test]
+    fn fold_relative_reflects_the_lead_and_the_placement() {
+        let lead = [Cell { state: 7, dy: 2 }, Cell { state: 9, dy: -1 }];
+        let base = fold_relative(lead.as_ptr(), lead.len(), at(0));
+        assert_ne!(base, fold_relative(lead.as_ptr(), lead.len(), at(4)));
+        let other = [Cell { state: 7, dy: 2 }, Cell { state: 9, dy: -2 }];
+        assert_ne!(base, fold_relative(other.as_ptr(), other.len(), at(0)));
+    }
+
+    #[test]
+    fn fold_relative_of_nothing_is_zero() {
+        let lead = [Cell { state: 1, dy: 0 }];
+        assert_eq!(fold_relative(std::ptr::null(), 1, at(0)), 0);
+        assert_eq!(fold_relative(lead.as_ptr(), 0, at(0)), 0);
+    }
 }
 
 /// Rotate a template-local offset by a placement's quarter turns.

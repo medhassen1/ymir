@@ -125,6 +125,7 @@ pub struct SecCache {
     budget: u64,
     spent: u64,
     clock: u64,
+    aged: u64,
 }
 
 impl SecCache {
@@ -134,7 +135,7 @@ impl SecCache {
     /// The budget is a starting estimate, not a hard ceiling: see
     /// [`SecCache::resolve`] for the one case that raises it.
     pub fn new(budget: u64) -> SecCache {
-        SecCache { entries: Vec::new(), budget: budget.max(1), spent: 0, clock: 0 }
+        SecCache { entries: Vec::new(), budget: budget.max(1), spent: 0, clock: 0, aged: 0 }
     }
 
     /// How many buffers are currently resident.
@@ -150,6 +151,21 @@ impl SecCache {
     /// The budget entries are currently aged out against.
     pub fn budget(&self) -> u64 {
         self.budget
+    }
+
+    /// Whether the cache has had to age anything out yet.
+    ///
+    /// Until it has, every shape the region has offered is still resident and
+    /// the residency says more about the region's length than its content. Once
+    /// it has, what is left is the working set the region's own pressure
+    /// selected.
+    pub fn settled(&self) -> bool {
+        self.aged > 0
+    }
+
+    /// A view of every buffer currently resident, in residency order.
+    pub fn resident_views(&self) -> Vec<SecBuf> {
+        self.entries.iter().map(|e| e.buf.view()).collect()
     }
 
     /// Resolve `key` to a section view, packing and caching on a miss.
@@ -183,6 +199,7 @@ impl SecCache {
                 .unwrap();
             let e = self.entries.swap_remove(victim);
             self.spent -= (e.buf.len as u64).min(self.spent);
+            self.aged += 1;
         }
 
         let buf = SecBuf::pack(units);
@@ -297,9 +314,17 @@ impl WarmSet {
 /// cross-region term beyond each column's own immediate fold, the same way a
 /// caller might resolve a view early and read it back later in the same
 /// rebuild.
+///
+/// The closing fold has a second term beside the warm set: the cache's working
+/// set, captured the moment the cache first has to age something out. Up to
+/// that point residency only says how many distinct shapes the region has
+/// offered; from it, what is resident is what the region's own pressure
+/// selected, and folding that once at the end gives the digest a term for the
+/// shapes the region settled on rather than the ones it merely touched.
 pub fn resolve_region(region: &Region, n: usize) -> u64 {
     let mut cache = SecCache::new(budget::cache_units(region, n));
     let mut warm = WarmSet::new();
+    let mut working: Vec<SecBuf> = Vec::new();
     let mut acc = 0xffu64;
 
     for cid in 0..n {
@@ -328,6 +353,13 @@ pub fn resolve_region(region: &Region, n: usize) -> u64 {
         if units.len() >= WARM_MIN_UNITS {
             warm.keep(WarmView { buf: view.view(), blocks: col.block_count() });
         }
+
+        // The first time the cache has to age a shape out, whatever survived is
+        // the working set the region's pressure picked. Take it once — a later
+        // snapshot would describe a different, later region.
+        if working.is_empty() && cache.settled() {
+            working = cache.resident_views();
+        }
     }
 
     // Close out the pass by folding in every warm view once, now that the whole
@@ -335,6 +367,12 @@ pub fn resolve_region(region: &Region, n: usize) -> u64 {
     for w in warm.views() {
         acc = acc.wrapping_mul(0x100000001b3)
             ^ gather::fold_span(w.buf.as_ptr(), w.buf.len(), w.blocks);
+    }
+
+    // Then the working set, so the digest carries what the region settled on.
+    for v in &working {
+        acc = acc.wrapping_mul(0x9e3779b97f4a7c15)
+            ^ gather::fold_span(v.as_ptr(), v.len(), v.len());
     }
     acc
 }
@@ -407,6 +445,37 @@ mod tests {
             c.resolve(1, &[0; 4]).len() == 4,
             "the refreshed entry must still be resident"
         );
+    }
+
+    /// Residency is what the budget is for. A cache walked over a long run of
+    /// distinct shapes must hold what the budget admits and no more, however
+    /// many shapes the region offers — otherwise the pass keeps every buffer
+    /// the region ever packed.
+    #[test]
+    fn residency_stays_inside_the_budget_over_a_long_run() {
+        let mut c = SecCache::new(64);
+        for key in 0..200u32 {
+            let _ = c.resolve(key, &[key; 8]);
+        }
+        assert!(c.settled(), "a run this long must have aged shapes out");
+        assert!(
+            c.spent() <= c.budget(),
+            "residency outgrew its budget: {} units against {}",
+            c.spent(),
+            c.budget()
+        );
+        assert!(c.resident() <= 8, "at 8 units a shape, 64 units is 8 shapes");
+    }
+
+    #[test]
+    fn a_fresh_cache_has_not_settled() {
+        let mut c = SecCache::new(1_000_000);
+        assert!(!c.settled());
+        assert!(c.resident_views().is_empty());
+        let _a = c.resolve(1, &[0; 4]);
+        let _b = c.resolve(2, &[0; 4]);
+        assert!(!c.settled(), "nothing was aged out, so nothing has settled");
+        assert_eq!(c.resident_views().len(), 2);
     }
 
     #[test]

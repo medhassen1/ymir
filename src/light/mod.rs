@@ -284,11 +284,20 @@ struct NodeArena {
     /// Chunks holding committed column frontiers, oldest first. The last is
     /// the one currently being written to; the rest are retired.
     chunks: Vec<ArenaChunk>,
+    /// The first frontier the arena took, kept so the pass can measure later
+    /// columns against where the region's light started rather than only
+    /// against their own neighbours.
+    seed: Option<(*const LightNode, usize)>,
 }
 
 impl NodeArena {
     fn new() -> NodeArena {
-        NodeArena { chunks: Vec::new() }
+        NodeArena { chunks: Vec::new(), seed: None }
+    }
+
+    /// The region's seed frontier, once a column has committed one.
+    fn seed(&self) -> Option<(*const LightNode, usize)> {
+        self.seed
     }
 
     /// Nodes held across every chunk the arena has allocated.
@@ -302,8 +311,11 @@ impl NodeArena {
     ///
     /// If what remains of the open chunk cannot hold `nodes`, a fresh chunk
     /// takes over first, so the returned pointer's `nodes.len()` entries are
-    /// always contiguous — addressing live memory for as long as the chunk
-    /// backing them stays where it is (see [`NodeArena::shrink_to_fit`]).
+    /// always contiguous. Committing also right-sizes what the arena has
+    /// retired (see [`NodeArena::shrink_to_fit`]) — giving the slack back is
+    /// part of taking a frontier rather than a pass the caller schedules, so
+    /// the arena's footprint tracks the light it holds however the region
+    /// drives it.
     fn commit(&mut self, nodes: &[LightNode]) -> *const LightNode {
         let len = nodes.len();
         if !self.chunks.last().is_some_and(|c| c.room() >= len) {
@@ -317,6 +329,10 @@ impl NodeArena {
         // offset within it.
         let ptr = unsafe { chunk.nodes.as_ptr().add(at) };
         chunk.used = at + len;
+        if self.seed.is_none() {
+            self.seed = Some((ptr, len));
+        }
+        self.shrink_to_fit(SHRINK_MAX_CHUNKS);
         ptr
     }
 
@@ -391,6 +407,10 @@ impl BleedWindow {
 /// had its turn, the region's closing pass folds the window's frontiers once
 /// more, letting light bleed across a column boundary beyond the column that
 /// produced it.
+///
+/// Every column is also bled against the arena's seed frontier as it commits,
+/// so the digest carries how far the region's light has drifted from where it
+/// started rather than only what each column resolved on its own.
 pub fn propagate_region(region: &Region, n: usize) -> u64 {
     let sources = load_sources(region);
     if sources.is_empty() {
@@ -422,9 +442,13 @@ pub fn propagate_region(region: &Region, n: usize) -> u64 {
         let ptr = arena.commit(&nodes);
         window.offer(BleedSource { ptr, len: nodes.len() });
 
-        // Hand back the slack the arena's retired chunks are sitting on, now
-        // that this column's nodes are safely committed.
-        arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
+        // Bleed this column against where the region's light started. The seed
+        // is the arena's own — a caller that tracked it separately would be
+        // second-guessing which frontier the arena took first.
+        if let Some((seed, seed_len)) = arena.seed() {
+            acc = acc.wrapping_mul(0x100000001b3)
+                ^ diffuse::fold_drift(seed, seed_len, ptr, nodes.len());
+        }
     }
 
     // Close out the pass by folding in every frontier the window holds,
@@ -562,9 +586,9 @@ mod tests {
     fn shrink_to_fit_trims_retired_chunks_to_their_live_prefix() {
         let mut arena = NodeArena::new();
         arena.commit(&nodes(200));
+        assert_eq!(arena.capacity(), ARENA_CHUNK_NODES);
+        // The second commit retires the first chunk, and committing trims it.
         arena.commit(&nodes(200));
-        assert_eq!(arena.capacity(), 2 * ARENA_CHUNK_NODES);
-        arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
         assert_eq!(arena.capacity(), 200 + ARENA_CHUNK_NODES);
         assert_eq!(arena.chunks[0].used, 200, "trimming must keep every live node");
         // Running again is a no-op: the retired chunk is already exact.
@@ -581,6 +605,43 @@ mod tests {
         let held = arena.capacity();
         arena.shrink_to_fit(SHRINK_MAX_CHUNKS);
         assert_eq!(arena.capacity(), held, "trimming must respect the bound");
+    }
+
+    /// Right-sizing is what committing a frontier buys: a chunk the arena has
+    /// retired must hold exactly the nodes in it, not the room it was allocated
+    /// with. An arena that stopped trimming — or deferred it to after the pass —
+    /// would sit on a mostly-empty chunk per thin column.
+    #[test]
+    fn retired_chunks_carry_no_slack() {
+        let mut arena = NodeArena::new();
+        // Three commits, each too wide for what the last chunk has left, so two
+        // chunks retire while the arena is still inside its trimming bound.
+        for _ in 0..3 {
+            arena.commit(&nodes(200));
+        }
+        let retired = arena.chunks.len() - 1;
+        assert_eq!(retired, 2, "each commit must retire the chunk before it");
+        for (i, chunk) in arena.chunks[..retired].iter().enumerate() {
+            assert_eq!(
+                chunk.nodes.len(),
+                chunk.used,
+                "retired chunk {i} still holds {} unused nodes",
+                chunk.nodes.len() - chunk.used
+            );
+        }
+    }
+
+    #[test]
+    fn the_arena_names_the_first_frontier_it_took() {
+        let mut arena = NodeArena::new();
+        assert!(arena.seed().is_none());
+        let first = arena.commit(&nodes(4));
+        let (seed, len) = arena.seed().expect("a frontier was committed");
+        assert_eq!(seed, first);
+        assert_eq!(len, 4);
+        // A later commit does not move the seed off the first frontier.
+        arena.commit(&nodes(6));
+        assert_eq!(arena.seed().map(|(_, l)| l), Some(4));
     }
 
     #[test]

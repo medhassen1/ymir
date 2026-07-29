@@ -16,6 +16,7 @@
 //! property as it is decoded, and reads a small deferred set of them once more
 //! after the whole section has been walked.
 
+use crate::chunk;
 use crate::common::*;
 use crate::parse::Region;
 use crate::reader::Cursor;
@@ -75,6 +76,13 @@ const ARENA_LOAD_EIGHTHS: usize = 6;
 
 /// Slots in [`DeferredSet`].
 const DEFER_SLOTS: usize = 3;
+
+/// Block-state names the store is seeded with before the trees are walked.
+///
+/// A tile entity names a handful of blocks; past this many the seeds stop
+/// earning their room, so a region of thousands of distinct states does not
+/// fill the arena with names nothing will ask for.
+const MAX_SEEDED_STATES: usize = 96;
 
 /// A region-lifetime arena for interned property name bytes.
 ///
@@ -323,9 +331,47 @@ fn decode_subtree(c: &mut Cursor, tree: &mut Tree, depth: u32, budget: &mut usiz
         fold.deferred.defer(prop);
 
         if kind == ValueKind::Compound {
+            let before = fold.acc;
             decode_subtree(c, tree, depth + 1, budget, fold);
+            // Close the compound now that its subtree is decoded: its digest is
+            // the name it was opened under together with what it contained.
+            fold.acc = fold.acc.wrapping_mul(0x9e3779b97f4a7c15)
+                ^ resolve::close_compound(&prop, fold.acc ^ before);
         }
     }
+}
+
+/// Names for the block states the region's columns place, in first-seen order.
+///
+/// Only states a section's blocks actually refer to are named: a palette entry
+/// nothing places is a leftover from before the last repack and no tile entity
+/// will name it. The list is capped so a region of thousands of distinct states
+/// does not seed the store with more names than any tree could refer to.
+fn placed_states(region: &Region) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<u16> = Vec::new();
+    for cid in 0..region.worked_chunks() {
+        let Ok(col) = chunk::decode(region, cid) else {
+            continue;
+        };
+        for s in &col.sections {
+            if s.is_empty() {
+                continue;
+            }
+            for i in 0..s.blocks.len() {
+                let state = s.state_at(i);
+                if state == 0 || seen.contains(&state) {
+                    continue;
+                }
+                seen.push(state);
+                out.push(format!("block/{state:04x}"));
+                if out.len() >= MAX_SEEDED_STATES {
+                    return out;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Decode the region's tile-entity trees and fold a digest of them.
@@ -349,6 +395,15 @@ pub fn decode_region(region: &Region) -> u64 {
     for common in ["id", "x", "y", "z", "Items"] {
         tree.names.intern(common);
     }
+    // Then one name per block state the region's columns actually place. A
+    // tile entity overwhelmingly names blocks it sits among — a chest names its
+    // contents, a spawner its mob's drop — so pre-interning what the region
+    // contains means those properties share a string instead of committing
+    // their own. What the store already holds by the time the trees are walked
+    // is therefore a property of the region, not of its `tile` section.
+    for state in placed_states(region) {
+        tree.names.intern(&state);
+    }
     decode_subtree(&mut c, &mut tree, 0, &mut budget, &mut fold);
 
     let mut acc = fold.acc;
@@ -368,6 +423,37 @@ mod tests {
         assert_eq!(ValueKind::from_nibble(1), ValueKind::Text);
         assert_eq!(ValueKind::from_nibble(2), ValueKind::Compound);
         assert_eq!(ValueKind::from_nibble(7), ValueKind::List);
+    }
+
+    /// The arena exists to hold distinct name bytes, not one run per property.
+    /// A store walked over many repeats of a few names must stay sized by the
+    /// names, and one walked over many distinct names must not answer by
+    /// reserving a run out of all proportion to what it holds.
+    #[test]
+    fn the_name_arena_stays_proportional_to_what_is_interned() {
+        let mut repeats = NameStore::new();
+        for _ in 0..500 {
+            repeats.intern("Items");
+            repeats.intern("id");
+        }
+        assert_eq!(repeats.len(), 2, "repeats must be shared, not re-committed");
+        assert!(
+            repeats.reserved() <= ARENA_INITIAL_BYTES,
+            "a store of two names reserved {} bytes",
+            repeats.reserved()
+        );
+
+        let mut distinct = NameStore::new();
+        for i in 0..300 {
+            distinct.intern(&format!("prop{i:04}"));
+        }
+        assert_eq!(distinct.len(), 300);
+        assert!(
+            distinct.reserved() <= 4 * distinct.bytes(),
+            "the arena reserved {} bytes to hold {}",
+            distinct.reserved(),
+            distinct.bytes()
+        );
     }
 
     #[test]

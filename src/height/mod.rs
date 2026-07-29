@@ -216,9 +216,21 @@ impl HeightArena {
     }
 }
 
-/// A column's map span, named for later columns and the closing profile pass to
-/// measure slope against.
+/// A column's map span, named for the closing profile pass to measure slope
+/// against.
+///
+/// The closing pass walks the ring exactly once, so it takes the address the
+/// arena gave out rather than resolving a position per landmark.
 struct Landmark {
+    ptr: *const u16,
+    rows: usize,
+}
+
+/// The tallest map of the wave currently open, kept so the wave's relief can be
+/// folded at the boundary rather than when the column that set it was
+/// committed.
+#[derive(Clone, Copy)]
+struct Crest {
     ptr: *const u16,
     rows: usize,
 }
@@ -320,6 +332,9 @@ pub fn rebuild_region(region: &Region, n: usize) -> u64 {
 
     let mut arena = HeightArena::new();
     let mut landmarks = LandmarkRing::new();
+    // The tallest map of the wave currently open. A wave's relief is folded
+    // when the wave closes, which is the only point at which it is known.
+    let mut crest: Option<Crest> = None;
     let mut acc = 0xffu64 ^ (bias as i64 as u64);
 
     for cid in 0..n {
@@ -346,6 +361,13 @@ pub fn rebuild_region(region: &Region, n: usize) -> u64 {
         let wave_boundary = map.rows() == MAP_EDGE;
         if wave_boundary {
             arena.rewind();
+            // The wave that just ended contributes its relief: the crest is the
+            // tallest map it covered, and how far that stands over the wave's
+            // floor is what distinguishes a ridge from a plateau.
+            if let Some(c) = crest.take() {
+                acc = acc.wrapping_mul(0x9e3779b97f4a7c15)
+                    ^ profile::relief(c.ptr, c.rows, MAP_EDGE);
+            }
         }
 
         // Commit this column's finished map into the region's arena. Only
@@ -356,6 +378,9 @@ pub fn rebuild_region(region: &Region, n: usize) -> u64 {
         let ptr = arena.commit(map.columns());
         acc = acc.wrapping_mul(0x100000001b3) ^ profile::slope_sum(ptr, rows, MAP_EDGE, bias);
         landmarks.offer(Landmark { ptr, rows });
+        if crest.as_ref().map_or(true, |c| rows > c.rows) {
+            crest = Some(Crest { ptr, rows });
+        }
 
         if wave_boundary {
             // The next wave starts from here.

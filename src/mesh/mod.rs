@@ -15,9 +15,11 @@
 //! fixed-size chunks and hands back a pointer into them instead of an owned
 //! buffer. A column whose mesh is too large for what remains of the open chunk
 //! starts a fresh one and leaves the old chunk's tail unused, so an arena that
-//! has taken a run of oversized columns ends up fragmented;
-//! [`VertexArena::coalesce`] merges the retired chunks back into tightly packed
-//! ones and hands the slack back to the allocator.
+//! has taken a run of oversized columns ends up fragmented. Committing is
+//! therefore also what repacks: each commit merges the recently retired chunks
+//! back into tightly packed ones and hands the slack back to the allocator,
+//! which is what keeps a long region's arena sized by the mesh it holds rather
+//! than by how many columns the region happens to have.
 
 use crate::budget;
 use crate::chunk::{self, linear_index, Column, SectionData};
@@ -267,13 +269,14 @@ pub fn mesh_column(col: &Column, slots: usize) -> MeshBuilder {
 /// commit never has to look past the chunk it lands in.
 const ARENA_CHUNK_VERTS: usize = 512;
 
-/// Retired vertices past which [`VertexArena::coalesce`] stops merging.
+/// Retired chunks [`VertexArena::reclaim`] will walk in one pass.
 ///
-/// Merging copies every vertex it moves. While the arena is short that copy is
-/// cheap next to the pages it hands back, but the cost grows with the arena and
-/// the slack recovered does not, so past this much retired mesh the arena keeps
-/// its fragmentation rather than paying to walk itself on every column.
-const COALESCE_LIMIT_VERTS: usize = 1024;
+/// Merging copies every vertex it moves, so a pass over the whole arena would
+/// make each commit cost what the region has meshed so far. Bounding the window
+/// keeps that cost flat: the newest retired chunks are where a ragged run of
+/// columns leaves its slack, and the older ones behind them were already packed
+/// tight by an earlier pass.
+const RECLAIM_WINDOW_CHUNKS: usize = 4;
 
 /// Slots in [`SeamBelt`].
 const SEAM_SLOTS: usize = 4;
@@ -337,49 +340,79 @@ impl VertexArena {
         self.chunks.iter().map(|c| c.verts.len()).sum()
     }
 
+    /// Where the mesh committed most recently landed, as an arena position
+    /// rather than an address.
+    ///
+    /// A caller that will read a mesh back more than once holds this instead of
+    /// the pointer: a position is the arena's own coordinate for a commit, and
+    /// costs the caller two words rather than a word and a lifetime.
+    fn locate(&self, len: usize) -> ArenaSlot {
+        let chunk = self.chunks.len().saturating_sub(1);
+        let at = self.chunks.last().map_or(0, |c| c.used.saturating_sub(len));
+        ArenaSlot { chunk, at }
+    }
+
+    /// The address `slot` names in the arena's current layout, or null if the
+    /// arena no longer has that many chunks.
+    fn resolve(&self, slot: ArenaSlot) -> *const Vertex {
+        match self.chunks.get(slot.chunk) {
+            // SAFETY: `slot.chunk` was just bounds-checked against `chunks`.
+            Some(chunk) => unsafe { chunk.verts.as_ptr().add(slot.at) },
+            None => std::ptr::null(),
+        }
+    }
+
     /// Commit `verts` into the arena and return a pointer to where they
     /// landed.
     ///
     /// If what remains of the open chunk cannot hold `verts`, a fresh chunk
     /// takes over first, so the returned pointer's `verts.len()` vertices are
-    /// always contiguous — addressing live memory for as long as the chunk
-    /// backing them stays where it is (see [`VertexArena::coalesce`]).
+    /// always contiguous. Committing also settles the arena's accumulated
+    /// fragmentation (see [`VertexArena::reclaim`]) — repacking is part of what
+    /// it means to commit rather than a separate pass the caller schedules, so
+    /// the arena's footprint tracks the mesh it holds however the region drives
+    /// it.
     fn commit(&mut self, verts: &[Vertex]) -> *const Vertex {
         let len = verts.len();
         if !self.chunks.last().is_some_and(|c| c.room() >= len) {
             self.chunks.push(ArenaChunk::empty(len.max(ARENA_CHUNK_VERTS)));
         }
         let chunk = self.chunks.last_mut().expect("a chunk was just ensured above");
-        chunk.append(verts)
+        let at = chunk.append(verts);
+        self.reclaim(RECLAIM_WINDOW_CHUNKS);
+        at
     }
 
-    /// Merge the arena's retired chunks into tightly packed ones, recovering
-    /// the slack their tails hold.
+    /// Merge the arena's recently retired chunks into tightly packed ones,
+    /// recovering the slack their tails hold.
     ///
     /// A column whose mesh does not fit what remains of the open chunk retires
     /// that chunk with its tail unused and starts a fresh one. Over a run of
-    /// such columns the waste adds up, and repacking the retired chunks hands
-    /// whole pages back to the allocator.
+    /// such columns the waste adds up, and repacking hands whole pages back to
+    /// the allocator.
     ///
-    /// Two conditions keep the pass from being busy-work. It runs only once a
-    /// full chunk's worth of slack has accumulated — below that there is no
-    /// page to hand back — and only while the retired mesh is still under
-    /// `limit`, past which the copy costs more than the slack it recovers. The
-    /// chunk currently being written to is never touched, since the next commit
+    /// Two conditions keep the pass from being busy-work. It walks only the
+    /// newest `window` retired chunks, which is where a ragged run leaves its
+    /// slack — everything older was already packed tight by an earlier pass —
+    /// and it runs only once a full chunk's worth of slack has gathered inside
+    /// that window, below which there is no page to hand back. The chunk
+    /// currently being written to is never touched, since the next commit
     /// continues into it.
-    fn coalesce(&mut self, limit: usize) {
+    fn reclaim(&mut self, window: usize) {
         let retired = self.chunks.len().saturating_sub(1);
-        if retired < 2 {
+        if retired < 2 || window < 2 {
             return;
         }
-        let live: usize = self.chunks[..retired].iter().map(|c| c.used).sum();
-        let held: usize = self.chunks[..retired].iter().map(|c| c.verts.len()).sum();
-        if live > limit || held - live < ARENA_CHUNK_VERTS {
+        let from = retired - retired.min(window);
+        let run = &self.chunks[from..retired];
+        let live: usize = run.iter().map(|c| c.used).sum();
+        let held: usize = run.iter().map(|c| c.verts.len()).sum();
+        if held - live < ARENA_CHUNK_VERTS {
             return;
         }
 
         let mut packed: Vec<ArenaChunk> = Vec::new();
-        for chunk in &self.chunks[..retired] {
+        for chunk in run {
             let mut rest = &chunk.verts[..chunk.used];
             while !rest.is_empty() {
                 if packed.last().map_or(0, ArenaChunk::room) == 0 {
@@ -391,15 +424,40 @@ impl VertexArena {
                 rest = &rest[take..];
             }
         }
-        packed.push(self.chunks.pop().expect("the open chunk"));
-        // Releases the retired chunks the vertices were copied out of.
-        self.chunks = packed;
+        // Splice the packed run back between the chunks it did not cover and
+        // the open chunk, releasing the ones the vertices were copied out of.
+        let mut rebuilt: Vec<ArenaChunk> = Vec::with_capacity(from + packed.len() + 1);
+        rebuilt.extend(self.chunks.drain(..from));
+        let open = self.chunks.pop().expect("the open chunk");
+        rebuilt.extend(packed);
+        rebuilt.push(open);
+        self.chunks = rebuilt;
     }
 }
 
 /// A column's committed mesh, named for the closing seam-weld pass to read.
+///
+/// The closing pass walks the belt exactly once, so it takes the address the
+/// arena gave out rather than resolving a position per mesh.
+#[derive(Clone, Copy)]
 struct SeamRef {
     ptr: *const Vertex,
+    len: usize,
+}
+
+/// A position in a [`VertexArena`]: which chunk, and how far into it.
+#[derive(Clone, Copy)]
+struct ArenaSlot {
+    chunk: usize,
+    at: usize,
+}
+
+/// The mesh the adjacency weld measures the next column against, held as an
+/// arena position because it is read on a later turn of the loop than the one
+/// that committed it.
+#[derive(Clone, Copy)]
+struct Adjacent {
+    slot: ArenaSlot,
     len: usize,
 }
 
@@ -435,16 +493,20 @@ impl SeamBelt {
 ///
 /// Each column's mesh is welded and folded as it is produced, then committed
 /// into a region-wide [`VertexArena`] rather than freed with the column, and
-/// offered to the [`SeamBelt`] as a boundary reference. Once every column has
-/// had its turn, the region's closing pass folds the belt's meshes once more,
-/// welding a seam against a neighbour whose own turn through the loop has
-/// already passed.
+/// offered to the [`SeamBelt`] as a boundary reference. Two seams are welded on
+/// top of that per-column work: the *adjacency* seam, where a column meets the
+/// one meshed immediately before it, is folded as soon as both sides are
+/// committed; and the region's closing pass folds the belt's meshes once more,
+/// welding against neighbours whose own turn through the loop has already
+/// passed.
 pub fn build_region(region: &Region, n: usize) -> u64 {
     // The per-column vertex reservation is sized from the region's rebuild
     // pressure, so a region of sparse columns does not over-reserve.
     let slots = budget::pool_slots(region, n);
     let mut arena = VertexArena::new();
     let mut belt = SeamBelt::new();
+    // The column meshed on the previous turn, held for the adjacency seam.
+    let mut prev: Option<Adjacent> = None;
     let mut acc = 0xffu64;
     for cid in 0..n {
         let col = match chunk::decode(region, cid) {
@@ -470,11 +532,21 @@ pub fn build_region(region: &Region, n: usize) -> u64 {
         // past this point is there a pointer stable enough to name past this
         // column's own scope.
         let ptr = arena.commit(builder.vertices());
-        belt.offer(SeamRef { ptr, len: builder.vertex_count() });
+        let here = SeamRef { ptr, len: builder.vertex_count() };
 
-        // Recover the slack the arena's retired chunks are sitting on, now
-        // that this column's vertices are safely committed.
-        arena.coalesce(COALESCE_LIMIT_VERTS);
+        // Weld the adjacency seam. The two columns meet along a shared chunk
+        // boundary, so the trailing corners of the earlier mesh and the leading
+        // corners of this one describe the same edge of the world and are
+        // folded together now that both sides are in the arena. The earlier
+        // mesh is resolved against the arena's current layout, since it was
+        // committed a turn ago.
+        if let Some(p) = prev {
+            acc = acc.wrapping_mul(0x100000001b3)
+                ^ emit::fold_boundary(arena.resolve(p.slot), p.len, here.ptr, here.len);
+        }
+
+        prev = Some(Adjacent { slot: arena.locate(here.len), len: here.len });
+        belt.offer(here);
     }
 
     // Close out the pass by folding in every boundary mesh the belt holds.
@@ -599,57 +671,66 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_leaves_an_unfragmented_arena_untouched() {
+    fn reclaim_leaves_an_unfragmented_arena_untouched() {
         let mut arena = VertexArena::new();
         arena.commit(&verts(4));
-        arena.coalesce(COALESCE_LIMIT_VERTS);
+        arena.reclaim(RECLAIM_WINDOW_CHUNKS);
         assert_eq!(arena.chunks.len(), 1);
-        // Two chunks, both near full: nothing worth recovering.
+        // Two chunks, the first exactly full: nothing worth recovering.
         arena.commit(&verts(ARENA_CHUNK_VERTS));
         assert_eq!(arena.chunks.len(), 2);
-        arena.coalesce(COALESCE_LIMIT_VERTS);
+        arena.reclaim(RECLAIM_WINDOW_CHUNKS);
         assert_eq!(arena.chunks.len(), 2);
     }
 
     #[test]
-    fn coalesce_repacks_retired_chunks_and_keeps_their_vertices() {
+    fn reclaim_repacks_retired_chunks_and_keeps_their_vertices() {
         let mut arena = VertexArena::new();
         // Each commit takes most of a chunk, so the next one retires it with
-        // its tail unused.
+        // its tail unused — and committing settles that fragmentation itself.
         for _ in 0..4 {
             arena.commit(&verts(300));
         }
-        assert_eq!(arena.chunks.len(), 4);
-        let before: usize = arena.chunks.iter().map(|c| c.used).sum();
-        arena.coalesce(COALESCE_LIMIT_VERTS);
-        assert!(arena.chunks.len() < 4, "coalescing must recover whole chunks");
+        assert!(arena.chunks.len() < 4, "committing must recover whole chunks");
         assert!(arena.capacity() < 4 * ARENA_CHUNK_VERTS);
-        let after: usize = arena.chunks.iter().map(|c| c.used).sum();
-        assert_eq!(before, after, "no vertex may be lost in the merge");
+        assert_eq!(
+            arena.chunks.iter().map(|c| c.used).sum::<usize>(),
+            4 * 300,
+            "no vertex may be lost in the merge"
+        );
     }
 
+    /// The arena's footprint must track the mesh it holds, not the number of
+    /// columns that produced it. A run of ragged commits leaves a chunk tail
+    /// unused every time, so an arena that stopped settling its fragmentation —
+    /// or deferred it to after the pass — would carry that waste for the whole
+    /// region.
     #[test]
-    fn coalesce_stops_once_the_retired_mesh_outgrows_the_limit() {
+    fn arena_slack_stays_bounded_across_a_long_run() {
         let mut arena = VertexArena::new();
-        for _ in 0..4 {
+        let commits = 40;
+        for _ in 0..commits {
             arena.commit(&verts(300));
         }
-        let chunks = arena.chunks.len();
-        // A limit under the retired mesh makes the copy not worth paying for.
-        arena.coalesce(64);
-        assert_eq!(arena.chunks.len(), chunks, "merging must respect the limit");
+        let used: usize = arena.chunks.iter().map(|c| c.used).sum();
+        assert_eq!(used, commits * 300, "no vertex may be lost across the run");
+        let slack = arena.capacity() - used;
+        assert!(
+            slack <= 3 * ARENA_CHUNK_VERTS,
+            "arena slack grew with the region: {slack} unused vertices held"
+        );
     }
 
     #[test]
-    fn coalesce_never_touches_the_open_chunk() {
+    fn reclaim_never_touches_the_open_chunk() {
         let mut arena = VertexArena::new();
         for _ in 0..3 {
             arena.commit(&verts(300));
         }
         let open = arena.commit(&verts(300));
-        arena.coalesce(COALESCE_LIMIT_VERTS);
+        arena.reclaim(RECLAIM_WINDOW_CHUNKS);
         // SAFETY: the open chunk is the one this pointer addresses, and
-        // coalescing only ever repacks the retired chunks behind it.
+        // repacking only ever covers the retired chunks behind it.
         unsafe {
             assert_eq!((*open.add(7)).pos, 7);
         }

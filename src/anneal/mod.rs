@@ -35,6 +35,44 @@ pub fn fold_columns(run: &[(*const u8, usize)]) -> u64 {
     acc
 }
 
+/// Fold a column against the pass's reference exposure.
+///
+/// Relighting one column at a time drifts: each column is smoothed against its
+/// own range, so a region relit in pieces ends up with the pieces disagreeing.
+/// Folding every column against one common reference gives the digest a term
+/// for that drift. `reference` names the reference column's packed levels and
+/// `here` the column being measured; both are `(pointer, count)` spans because
+/// [`crate::relight`] addresses its levels by where the pool put them.
+///
+/// SAFETY: `reference` must address at least `reference_count` live levels and
+/// `here` at least `here_count`, for the duration of the call.
+pub fn fold_against(
+    reference: *const u8,
+    reference_count: usize,
+    here: *const u8,
+    here_count: usize,
+) -> u64 {
+    if reference.is_null() || here.is_null() {
+        return 0;
+    }
+    let mut acc = (reference_count as u64).rotate_left(23) ^ (here_count as u64);
+    // SAFETY: per this function's contract each pointer addresses at least the
+    // count it is paired with.
+    let (a, b) = unsafe {
+        (
+            std::slice::from_raw_parts(reference, reference_count),
+            std::slice::from_raw_parts(here, here_count),
+        )
+    };
+    // The two columns rarely have the same number of levels; the drift term is
+    // the reference's own profile against as much of this column as lines up.
+    for (i, &l) in a.iter().enumerate() {
+        let against = b.get(i).copied().unwrap_or(0);
+        acc = acc.rotate_left(5) ^ ((l as u64) << 8) ^ (against as u64);
+    }
+    acc
+}
+
 /// Smooth a column's levels in place, averaging each with its neighbours.
 ///
 /// A merge boundary leaves a step in the light; one anneal pass softens it.
@@ -94,6 +132,26 @@ mod tests {
     fn fold_one_treats_null_as_the_count_only() {
         assert_eq!(fold_one(std::ptr::null(), 0), 0);
         assert_eq!(fold_one(std::ptr::null(), 4), 4);
+    }
+
+    #[test]
+    fn fold_against_measures_the_reference_against_the_column() {
+        let reference = [9u8, 9, 9, 9];
+        let here = [9u8, 9, 9, 9];
+        let flat = fold_against(reference.as_ptr(), 4, here.as_ptr(), 4);
+        let dark = [1u8, 1, 1, 1];
+        assert_ne!(flat, fold_against(reference.as_ptr(), 4, dark.as_ptr(), 4));
+        assert_ne!(flat, fold_against(dark.as_ptr(), 4, here.as_ptr(), 4));
+    }
+
+    #[test]
+    fn fold_against_tolerates_a_shorter_column() {
+        let reference = [4u8, 5, 6, 7];
+        let short = [4u8, 5];
+        // Only what lines up is compared; the rest folds against nothing.
+        assert_ne!(fold_against(reference.as_ptr(), 4, short.as_ptr(), 2), 0);
+        assert_eq!(fold_against(std::ptr::null(), 4, short.as_ptr(), 2), 0);
+        assert_eq!(fold_against(reference.as_ptr(), 4, std::ptr::null(), 2), 0);
     }
 
     #[test]

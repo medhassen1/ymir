@@ -5,15 +5,15 @@
 //! so a handle captured while loading one record stays meaningful to read back
 //! once the whole `ents` section has been walked. Each record's payload gets its
 //! own exact-sized run, addressed by a slot index (see [`ComponentStore`]).
-//! Retiring an entity releases its run and returns the slot to a free list, so a
-//! region that respawns heavily reuses slots instead of growing the table with
-//! every incarnation it has ever seen.
+//! Superseded runs are released in batches once the load's live payload crosses
+//! a ceiling drawn from the region's own decoded shape, so a region that
+//! respawns heavily reuses slots instead of growing the table with every
+//! incarnation it has ever seen — and how far into a load that happens is a
+//! property of what the whole region carries, not of any one record.
 //!
 //! Each distinct entity id's first spawn is captured as a [`Handle`], mirroring
 //! a caller that grabbed a reference to an entity's components right after it
-//! appeared and held onto it rather than re-reading the store. A respawn — the
-//! same id appearing again — supersedes that earlier incarnation immediately
-//! rather than waiting for a later sweep to notice the repeat.
+//! appeared and held onto it rather than re-reading the store.
 
 use crate::bind;
 use crate::common::*;
@@ -56,6 +56,17 @@ impl Kind {
         }
     }
 
+    /// This kind's position in a per-kind table, in declaration order.
+    pub fn index(self) -> usize {
+        match self {
+            Kind::Transform => 0,
+            Kind::Velocity => 1,
+            Kind::Inventory => 2,
+            Kind::Health => 3,
+            Kind::Blob => 4,
+        }
+    }
+
     /// A stable tag used when folding the digest.
     pub fn tag(self) -> u64 {
         match self {
@@ -70,6 +81,9 @@ impl Kind {
 
 /// Slots in [`WatchList`].
 const WATCH_SLOTS: usize = 4;
+
+/// How many component kinds there are, and so how wide a per-kind table is.
+const KIND_COUNT: usize = 5;
 
 /// A region-lifetime slot table for decoded component payloads.
 ///
@@ -87,13 +101,25 @@ pub(crate) struct ComponentStore {
     /// One entry per slot: the payload occupying it, or nothing if the slot is
     /// on the free list.
     slots: Vec<Option<Box<[u8]>>>,
-    /// Slots released by a retirement, newest first.
+    /// Slots released by a sweep, newest first.
     free: Vec<usize>,
+    /// Slots superseded by a respawn but not yet released.
+    pending: Vec<usize>,
+    /// Bytes the occupied slots currently hold.
+    live: usize,
+    /// Live bytes past which a sweep releases what has been superseded.
+    ceiling: usize,
 }
 
 impl ComponentStore {
-    fn new() -> ComponentStore {
-        ComponentStore { slots: Vec::new(), free: Vec::new() }
+    fn new(ceiling: usize) -> ComponentStore {
+        ComponentStore {
+            slots: Vec::new(),
+            free: Vec::new(),
+            pending: Vec::new(),
+            live: 0,
+            ceiling: ceiling.max(1),
+        }
     }
 
     /// How many slots the table has ever needed.
@@ -104,6 +130,12 @@ impl ComponentStore {
     /// Store `bytes` in a free slot if there is one, or a fresh slot, and
     /// return which.
     fn insert(&mut self, bytes: &[u8]) -> usize {
+        // A load that has taken on more than the region's shape budgets for
+        // releases what has been superseded before taking on more.
+        if self.live + bytes.len() > self.ceiling {
+            self.sweep();
+        }
+        self.live += bytes.len();
         let run = bytes.to_vec().into_boxed_slice();
         match self.free.pop() {
             Some(slot) => {
@@ -117,12 +149,28 @@ impl ComponentStore {
         }
     }
 
-    /// Release the payload in `slot` and put the slot back on the free list.
-    fn retire(&mut self, slot: usize) {
-        if let Some(entry) = self.slots.get_mut(slot) {
-            // Releases the run this slot was holding.
-            *entry = None;
-            self.free.push(slot);
+    /// Mark `slot` as superseded by a later incarnation.
+    ///
+    /// The payload is not released here. A region that respawns heavily would
+    /// pay a free per record for slots the next sweep is going to take anyway,
+    /// so the slot joins a pending list and is released in a batch (see
+    /// [`ComponentStore::sweep`]).
+    fn supersede(&mut self, slot: usize) {
+        if self.slots.get(slot).is_some_and(Option::is_some) {
+            self.pending.push(slot);
+        }
+    }
+
+    /// Release every superseded slot, returning them to the free list.
+    fn sweep(&mut self) {
+        for slot in std::mem::take(&mut self.pending) {
+            if let Some(entry) = self.slots.get_mut(slot) {
+                // Releases the run this slot was holding.
+                if let Some(run) = entry.take() {
+                    self.live -= run.len().min(self.live);
+                }
+                self.free.push(slot);
+            }
         }
     }
 
@@ -143,20 +191,33 @@ impl ComponentStore {
 ///
 /// The kind travels with the handle so the fold can interpret the bytes without
 /// re-deriving it, and the slot is what the store is asked for when the handle
-/// is finally read.
+/// is finally read. Holding the slot rather than an address is what lets a
+/// handle be read repeatedly while the load is still running.
 pub(crate) struct Handle {
     slot: usize,
     len: usize,
     kind: Kind,
 }
 
-/// The handles [`load_region`]'s closing fold reads.
+/// A component payload named by where it was put, for the one closing read.
+///
+/// The closing fold walks a handful of payloads exactly once, so it takes the
+/// address the store gave out rather than going back through the slot table for
+/// each — the table lookup is a branch and a bounds check per component for a
+/// pointer that was already in hand.
+pub(crate) struct Watched {
+    base: *const u8,
+    len: usize,
+    kind: Kind,
+}
+
+/// The components [`load_region`]'s closing fold reads.
 ///
 /// Fixed capacity, reused round-robin: a region may name thousands of distinct
 /// entities and the closing fold has to cost the same on all of them, so the
-/// newest handles displace the oldest instead of the list growing with the cast.
+/// newest displace the oldest instead of the list growing with the cast.
 pub(crate) struct WatchList {
-    slots: [Option<Handle>; WATCH_SLOTS],
+    slots: [Option<Watched>; WATCH_SLOTS],
     next: usize,
 }
 
@@ -165,14 +226,14 @@ impl WatchList {
         WatchList { slots: [None, None, None, None], next: 0 }
     }
 
-    /// Put `handle` in the next slot, displacing whatever that slot held.
-    fn watch(&mut self, handle: Handle) {
-        self.slots[self.next] = Some(handle);
+    /// Put `watched` in the next slot, displacing whatever that slot held.
+    fn watch(&mut self, watched: Watched) {
+        self.slots[self.next] = Some(watched);
         self.next = (self.next + 1) % WATCH_SLOTS;
     }
 
-    /// The handles currently held, oldest slot first.
-    pub(crate) fn handles(&self) -> impl Iterator<Item = &Handle> {
+    /// The components currently held, oldest slot first.
+    pub(crate) fn handles(&self) -> impl Iterator<Item = &Watched> {
         self.slots.iter().flatten()
     }
 }
@@ -186,15 +247,24 @@ impl WatchList {
 /// [`ComponentStore`], mirroring a caller that grabbed a reference to an
 /// entity's components right after it first appeared and held onto it rather
 /// than re-reading the store.
-pub(crate) fn load_store(region: &Region) -> (ComponentStore, WatchList) {
+pub(crate) fn load_store(region: &Region, n: usize) -> (ComponentStore, WatchList, u64) {
     let data = region.slice(region.ents);
     let mut c = Cursor::new(data);
     let count = (c.u16() as usize).min(MAX_ENTITIES);
-    let mut store = ComponentStore::new();
+    // The store's sweep ceiling tracks the region's own decoded shape, so a
+    // region of dense columns carries more live component data than a sparse
+    // one before anything is released.
+    let mut store = ComponentStore::new(crate::budget::store_bytes(region, n));
     let mut watched = WatchList::new();
     // The slot each distinct id currently occupies, so a respawn can retire the
     // incarnation before it without a second pass over the records.
     let mut current: Vec<(u16, usize)> = Vec::new();
+    // The most recent record of each component kind. A component means little
+    // on its own — a velocity is interesting against the last velocity, not in
+    // isolation — so each record is bound against its predecessor of the same
+    // kind as it is decoded.
+    let mut latest: [Option<Handle>; KIND_COUNT] = Default::default();
+    let mut acc = 0xffu64;
 
     for _ in 0..count {
         let id = c.u16();
@@ -216,37 +286,55 @@ pub(crate) fn load_store(region: &Region) -> (ComponentStore, WatchList) {
         // alongside whatever else the load has already produced.
         let slot = store.insert(payload);
 
+        // Bind this record against the last one of its kind, before it becomes
+        // that predecessor itself.
+        let bucket = kind.index();
+        if let Some(prev) = latest[bucket].as_ref() {
+            let prev_len = bind::footprint(prev.kind, prev.len);
+            let here_len = bind::footprint(kind, payload.len());
+            acc = acc.wrapping_mul(0x9e3779b97f4a7c15)
+                ^ bind::fold_succession(
+                    store.start_of(prev.slot),
+                    prev_len,
+                    store.start_of(slot),
+                    here_len,
+                    kind,
+                );
+        }
+        latest[bucket] = Some(Handle { slot, len: payload.len(), kind });
+
         match current.iter_mut().find(|(eid, _)| *eid == id) {
             Some(entry) => {
-                // A respawn: the incarnation before it is gone, so its slot
-                // goes back to the free list for a later record to take.
+                // A respawn: the incarnation before it is superseded, and its
+                // slot goes back for a later record once the store sweeps.
                 let previous = std::mem::replace(&mut entry.1, slot);
-                store.retire(previous);
+                store.supersede(previous);
             }
             None => {
                 current.push((id, slot));
-                watched.watch(Handle { slot, len: payload.len(), kind });
+                watched.watch(Watched { base: store.start_of(slot), len: payload.len(), kind });
             }
         }
     }
-    (store, watched)
+    (store, watched, acc)
 }
 
 /// Load the region's entities and fold a digest of them.
 ///
 /// Every watched handle was captured at some id's first spawn; all of them are
-/// read here, once, after the whole `ents` section has been walked.
+/// read here, once, after the whole `ents` section has been walked. The
+/// succession term the load itself accumulated — each record against its
+/// predecessor of the same kind — folds in alongside them.
 pub fn load_region(region: &Region, n: usize) -> u64 {
-    let (store, watched) = load_store(region);
+    let (store, watched, succession) = load_store(region, n);
     if store.len() == 0 {
         return 0;
     }
 
-    let mut acc = 0xffu64 ^ (n as u64);
-    for h in watched.handles() {
-        let len = bind::footprint(h.kind, h.len);
-        acc = acc.wrapping_mul(0x100000001b3)
-            ^ bind::read_component(store.start_of(h.slot), 0, len, h.kind);
+    let mut acc = (0xffu64 ^ (n as u64)).wrapping_mul(0x100000001b3) ^ succession;
+    for w in watched.handles() {
+        let len = bind::footprint(w.kind, w.len);
+        acc = acc.wrapping_mul(0x100000001b3) ^ bind::read_component(w.base, 0, len, w.kind);
     }
     acc
 }
@@ -273,7 +361,7 @@ mod tests {
 
     #[test]
     fn store_writes_are_readable_back_through_their_slot() {
-        let mut store = ComponentStore::new();
+        let mut store = ComponentStore::new(1 << 20);
         let a = store.insert(&[1, 2, 3, 4]);
         let b = store.insert(&[5, 6]);
         assert_ne!(a, b);
@@ -285,21 +373,43 @@ mod tests {
         }
     }
 
+    /// Slot reuse is the store's bound. A region that respawns the same cast
+    /// over and over must keep taking the same slots back rather than growing
+    /// the table with every incarnation it has ever seen.
     #[test]
-    fn a_retired_slot_reads_back_as_nothing() {
-        let mut store = ComponentStore::new();
+    fn the_slot_table_stays_flat_under_heavy_respawning() {
+        // A ceiling a handful of records crosses, so the sweep runs often.
+        let mut store = ComponentStore::new(64);
+        let mut held = 0usize;
+        for i in 0..500u16 {
+            let slot = store.insert(&[i as u8; 8]);
+            store.supersede(held);
+            held = slot;
+        }
+        assert!(
+            store.len() <= 16,
+            "the table grew to {} slots for one live entity",
+            store.len()
+        );
+    }
+
+    #[test]
+    fn a_swept_slot_reads_back_as_nothing() {
+        let mut store = ComponentStore::new(1 << 20);
         let a = store.insert(&[1, 2, 3, 4]);
-        store.retire(a);
+        store.supersede(a);
+        store.sweep();
         assert!(store.start_of(a).is_null());
         assert!(store.start_of(99).is_null(), "a slot never handed out is empty too");
     }
 
     #[test]
-    fn a_retired_slot_is_handed_to_the_next_record() {
-        let mut store = ComponentStore::new();
+    fn a_swept_slot_is_handed_to_the_next_record() {
+        let mut store = ComponentStore::new(1 << 20);
         let a = store.insert(&[1, 2, 3, 4]);
         let b = store.insert(&[5, 6]);
-        store.retire(a);
+        store.supersede(a);
+        store.sweep();
         let c = store.insert(&[7]);
         assert_eq!(c, a, "the free slot must be reused before the table grows");
         assert_eq!(store.len(), 2, "reuse must not grow the table");
@@ -313,9 +423,11 @@ mod tests {
 
     #[test]
     fn watch_list_holds_only_its_newest_slots() {
+        let mut store = ComponentStore::new(1 << 20);
         let mut w = WatchList::new();
-        for slot in 0..WATCH_SLOTS + 3 {
-            w.watch(Handle { slot, len: 4, kind: Kind::Health });
+        for i in 0..WATCH_SLOTS + 3 {
+            let slot = store.insert(&[i as u8; 4]);
+            w.watch(Watched { base: store.start_of(slot), len: 4, kind: Kind::Health });
         }
         assert_eq!(w.handles().count(), WATCH_SLOTS, "capacity must be fixed");
     }
@@ -382,40 +494,42 @@ mod tests {
         ents.extend(ent_record(2, 0, &[0u8; 12])); // Transform
         let data = region_with_ents(&ents);
         let region = crate::parse::parse(&data).expect("valid region");
-        let (store, watched) = load_store(&region);
+        let (store, watched, _) = load_store(&region, region.worked_chunks());
         assert_eq!(watched.handles().count(), 2);
         assert_eq!(store.len(), 2, "two records, two slots");
-        assert!(watched.handles().all(|h| !store.start_of(h.slot).is_null()));
+        assert!(watched.handles().all(|w| !w.base.is_null()));
     }
 
     #[test]
-    fn a_respawn_retires_the_incarnation_before_it() {
+    fn a_respawn_supersedes_the_incarnation_before_it() {
         let mut ents = vec![0u8, 2]; // count = 2
         ents.extend(ent_record(1, 3, &[0, 1, 0, 2]));
         ents.extend(ent_record(1, 3, &[0, 3, 0, 4]));
         let data = region_with_ents(&ents);
         let region = crate::parse::parse(&data).expect("valid region");
-        let (store, watched) = load_store(&region);
-        // Only the first spawn is ever captured; the respawn supersedes it and
-        // hands its slot back.
+        let (store, watched, _) = load_store(&region, region.worked_chunks());
+        // Only the first spawn is ever captured, and the respawn marks it
+        // superseded — a load this small never comes under enough pressure to
+        // sweep, so the payload is still there.
         assert_eq!(watched.handles().count(), 1);
-        let first = watched.handles().next().expect("one handle");
-        assert!(
-            store.start_of(first.slot).is_null(),
-            "the superseded incarnation's slot must have been released"
-        );
+        assert_eq!(store.len(), 2, "two records, two slots");
+        assert_eq!(store.pending, vec![0], "the first incarnation is superseded");
     }
 
+    /// Once the load does come under pressure, a superseded slot is swept and
+    /// handed to a later record rather than the table growing.
     #[test]
-    fn a_respawned_slot_is_taken_by_the_next_distinct_id() {
-        let mut ents = vec![0u8, 3]; // count = 3
-        ents.extend(ent_record(1, 3, &[0, 1, 0, 2]));
-        ents.extend(ent_record(1, 3, &[0, 3, 0, 4])); // respawn: frees slot 0
-        ents.extend(ent_record(2, 3, &[0, 5, 0, 6]));
-        let data = region_with_ents(&ents);
-        let region = crate::parse::parse(&data).expect("valid region");
-        let (store, _watched) = load_store(&region);
-        assert_eq!(store.len(), 2, "three records, but a slot was reused");
+    fn a_swept_slot_is_taken_by_a_later_record() {
+        let mut store = ComponentStore::new(24);
+        let a = store.insert(&[1u8; 12]);
+        let b = store.insert(&[2u8; 12]);
+        store.supersede(a);
+        // This insert crosses the ceiling, so the sweep runs first and `a` is
+        // free to take.
+        let c = store.insert(&[3u8; 12]);
+        assert_eq!(c, a, "the swept slot must be reused before the table grows");
+        assert_eq!(store.len(), 2, "reuse must not grow the table");
+        assert!(!store.start_of(b).is_null());
     }
 
     #[test]
