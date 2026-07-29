@@ -158,8 +158,8 @@ def ents(records):
 def tile(props):
     """Property tree: (kind, name, value).
 
-    A Compound (kind % 4 == 2) carries its children as its value, encoded as a
-    nested subtree, so a fixture can exercise the decoder's recursion.
+    A Compound (kind % 4 == 2) carries its children as its value, encoded as
+    a nested subtree.
     """
     out = bytearray(u16(len(props)))
     for kind, name, value in props:
@@ -238,8 +238,7 @@ def shallow_column():
 def lit_column(state=5):
     """A column flagged as carrying light, for the relight stage.
 
-    `state` sets how opaque the lit half is, which is what makes two such
-    columns differ in mean exposure.
+    `state` sets how opaque the lit half is.
     """
     body = section([0, state], flags=SEC_HAS_LIGHT, runs=[(128, 1), (128, 0)])
     return chunk([body], base_y=0)
@@ -251,15 +250,13 @@ def fixtures():
 
     return {
         "seccache_ok": region(FLAG["seccache"], [col]),
-        # Flat columns so the mesher's per-section faces stay distinct, and two
-        # of them so the region has an adjacency seam to weld.
+        # Two flat columns.
         "mesh_ok": region(FLAG["mesh"], [flat, flat]),
         "light_ok": region(
             FLAG["light"], [col],
             {b"lgts": lgts([(0, 0x888, 12, False)])},
         ),
-        # Two Transforms among the records, so a component is bound against a
-        # predecessor of its own kind rather than every record standing alone.
+        # Three records: two Transforms and a Health.
         "entity_ok": region(
             FLAG["entity"], [col],
             {b"ents": ents([
@@ -268,8 +265,7 @@ def fixtures():
                 (3, 0, i32(9) + i32(66) + i32(-4)),     # Transform
             ])},
         ),
-        # A compound so the decoder's recursion is covered, nesting only names
-        # the store already carries.
+        # A compound property, nesting only names the store already carries.
         "tile_ok": region(
             FLAG["tile"], [col],
             {b"tile": tile([
@@ -278,11 +274,9 @@ def fixtures():
                 (2, "Items", [(1, "id", "chest"), (0, "z", 12)]),
             ])},
         ),
-        # A flat column opens the pass, a tall one raises the wave, and a
-        # second flat one closes it — so the digest covers a whole wave, not
-        # just one column's slope.
+        # Flat, tall, flat.
         "height_ok": region(FLAG["height"], [flat, col, flat], {b"hgts": hgts(6)}),
-        # Two columns, so the blend has a boundary to carry the stencil across.
+        # Two columns.
         "biome_ok": region(
             FLAG["biome"], [col, col],
             {b"biom": (
@@ -290,7 +284,7 @@ def fixtures():
                 + biom(5, 0, [5, 5, 6, 6, 5, 6, 6, 7, 6, 6, 7, 7, 6, 7, 7, 7])
             )},
         ),
-        # Two templates, so the second is positioned against the first.
+        # Two templates.
         "struct_ok": region(
             FLAG["struct"], [col],
             {b"strc": strc([
@@ -300,11 +294,7 @@ def fixtures():
         ),
         "tick_ok": region(
             FLAG["tick"], [col],
-            # Every queued tick is already due, so the drain keeps them all.
-            # They are spread far enough apart that the drain cuts several
-            # rounds rather than firing in one pass, and far enough into the
-            # queue that where the last round ends depends on how the earlier
-            # ones went.
+            # Eight ticks, all already due, in four widely spaced pairs.
             {b"tick": tick(2000, [
                 (0, 0x101, 0), (100, 0x102, 1),
                 (300, 0x202, 1), (400, 0x203, 2),
@@ -312,9 +302,7 @@ def fixtures():
                 (1100, 0x404, 1), (1300, 0x405, 0),
             ])},
         ),
-        # Three dirty columns of differing exposure, so the pass has a
-        # reference column to measure the others against. Well under the
-        # in-flight cap, so no slab is recycled.
+        # Three dirty columns of differing exposure.
         "relight_ok": region(
             FLAG["relight"], [lit_column(5), lit_column(11), lit_column(2)],
         ),
